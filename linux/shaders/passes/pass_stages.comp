@@ -1,0 +1,45 @@
+#version 460
+// dlsslop-amd: its stages after every pass (RuntimeConfig::pass_stages), with the
+// math of its HIP backend (backend/tuning_math.h, backend/color_preserve_math.h),
+// from the pass's answer into the target. Mode 0 sharpens: the answer plus
+// strength times its detail above a 3x3 binomial blur. Mode 1 removes strength
+// times the chroma of the answer's broad change from the frame the first pass
+// saw: that change low-passed by the same blur, less its luma. While luma is in
+// [0,1], the removal is shortened so that no channel leaves [0,1] or goes further
+// outside it than the pass put it. The filter clamps to the picture.
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=0,rgba32f) uniform readonly image2D source;
+layout(set=0,binding=1) uniform sampler2D reference;
+layout(set=0,binding=2,rgba32f) uniform writeonly image2D target;
+layout(push_constant) uniform Push { uint width, height; float strength; uint anchor; } pc;
+
+float luma(vec3 rgb) { return dot(rgb, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= pc.width || xy.y >= pc.height) return;
+    const vec4 model = imageLoad(source, xy);
+    const ivec2 last = ivec2(pc.width, pc.height) - 1;
+    vec3 low = vec3(0);
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(xy + ivec2(dx, dy), ivec2(0), last);
+            const float weight = float((dx != 0 ? 1 : 2) * (dy != 0 ? 1 : 2)) * 0.0625;
+            vec3 sample_rgb = imageLoad(source, q).rgb;
+            if (pc.anchor != 0u) sample_rgb -= texelFetch(reference, q, 0).rgb;
+            low += weight * sample_rgb;
+        }
+    if (pc.anchor == 0u) {
+        imageStore(target, xy, vec4(model.rgb + pc.strength * (model.rgb - low), model.a));
+        return;
+    }
+    const vec3 delta = pc.strength * (low - luma(low));
+    float scale = 1;
+    for (int c = 0; c < 3; ++c) {
+        const float edge = delta[c] > 0 ? min(model[c], 0) : max(model[c], 1);
+        if (delta[c] != 0) scale = min(scale, (model[c] - edge) / delta[c]);
+    }
+    const float level = luma(model.rgb);
+    if (level < 0 || level > 1) scale = 1;
+    imageStore(target, xy, vec4(model.rgb - scale * delta, model.a));
+}
