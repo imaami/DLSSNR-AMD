@@ -75,6 +75,12 @@ struct Controls {
     float local_structure = 1.0f;
     float skin_structure = -1.0f;
     bool automatic_mask = true;
+    // dlsslop-amd: its stages after every pass, with RuntimeConfig::pass_stages
+    // (shaders/passes/pass_stages.comp), 0..1 each; 0 skips. Sharpness adds the
+    // answer's detail above a 3x3 blur. Colour preservation removes that fraction
+    // of the chroma in the pass's broad change from the frame the first pass saw.
+    float sharpness = 0.0f;
+    float colour_preserve = 0.0f;
     // Per-pass overrides for passes 2..N; index 0 is pass 2. An entry with
     // `used == false`, or a pass past the end of this, inherits pass 1 with the
     // tone zeroed. Empty is exactly the behaviour that shipped before.
@@ -149,6 +155,12 @@ struct RuntimeConfig {
     // (its linear-HDR encode, or linear_input's own): the preprocess undoes the
     // knee first, so its curve is the only one. False for an SDR frame.
     bool preprocess_unknee = false;
+    // dlsslop-amd: record Controls::sharpness and colour_preserve after every
+    // pass, into a model-sized RGBA32F scratch image and, with both, back. The
+    // answer then stays RGBA32F instead of the post block storing the frame's
+    // format. Requires native compose, model_scale 1, display-encoded input, no
+    // control mask and no detail-only cascade.
+    bool pass_stages = false;
     // dlsslop-amd: explicit locations instead of `root`'s layout. A nonempty
     // model_pack selects them: the network's SPIR-V and markers in
     // network_shaders, with runtime/ and temporal/ below it, and a writable

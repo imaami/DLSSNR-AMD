@@ -23,6 +23,7 @@ void validate(const Controls& c) {
     if (!range(c.intensity, 0, 2) || !range(c.detail_strength, 0, 2) || !range(c.colour_strength, 0, 4) ||
         !range(c.max_ratio, 1, 8) || !range(c.local_tone, 0, 2) ||
         !range(c.local_structure, 0, 2) || !range(c.skin_structure, -1, 2) ||
+        !range(c.sharpness, 0, 1) || !range(c.colour_preserve, 0, 1) ||
         c.style < 0 || c.style > 2 || c.passes < 1)
         throw std::invalid_argument("invalid NR controls");
 }
@@ -357,6 +358,12 @@ struct Runtime::Impl {
     int cascade_radius{4};
     nrvk::Context::Image lograt{}, cascade_tmp{}, lowpass{};
     nrvk::Kernel cascade_lograt, cascade_blur_h, cascade_blur_v, cascade_feed;
+    // dlsslop-amd: RuntimeConfig::pass_stages, pass_stages.spv. The first active
+    // stage writes the answer into the scratch, which then holds the answer, and
+    // a second writes it back; alpha_scratch restores the frame's alpha there.
+    bool pass_stages{};
+    nrvk::Context::Image stage_scratch{};
+    nrvk::Kernel to_scratch, from_scratch, alpha_scratch;
     std::vector<nrvk::Context::Image> history_store;
     // ---- what the pass costs, measured on the GPU ----------------------------
     //
@@ -848,6 +855,10 @@ struct Runtime::Impl {
         if (cascade_blur_h.device) cascade_blur_h.destroy();
         if (cascade_blur_v.device) cascade_blur_v.destroy();
         if (cascade_feed.device) cascade_feed.destroy();
+        if (stage_scratch.handle) session.ctx.destroy(stage_scratch);
+        if (to_scratch.device) to_scratch.destroy();
+        if (from_scratch.device) from_scratch.destroy();
+        if (alpha_scratch.device) alpha_scratch.destroy();
         for (auto& h : history_store) session.ctx.destroy(h);
         for (auto& f : features) if (f.second.history.handle) session.ctx.destroy(f.second.history);
         for (auto& r : retiring) if (r.first.handle) session.ctx.destroy(r.first);
@@ -1107,7 +1118,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &f3};
         vkGetPhysicalDeviceFormatProperties2(host.physical, unorm, &f2);
         impl_->direct_out = NR_DIRECT_OUT && NR_POST_ALPHA && impl_->direct_in && config.native_compose && store_matches_blit &&
-                            mask_config.width == 0 &&
+                            mask_config.width == 0 && !config.pass_stages &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT);
         nr::logf("[nr] input %s, write-back %s", impl_->direct_in ? "copied in the frame's format"
@@ -1165,6 +1176,22 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             impl_->cascade_feed.create(s.ctx, (adapters / "cascade_feed.spv").string(), {}, 12,
                                        {&impl_->shown_keep, &impl_->lograt, &impl_->lowpass, &tex_in_storage});
         }
+    }
+    if (config.pass_stages) {
+        if (!config.native_compose || impl_->scaled || config.linear_input || mask_config.width ||
+            config.cascade_detail_only)
+            throw std::invalid_argument("pass stages need native compose, model scale 1, display-encoded input, "
+                                        "no control mask and no detail-only cascade");
+        impl_->pass_stages = true;
+        impl_->stage_scratch = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+        s.ctx.transition(impl_->stage_scratch, VK_IMAGE_LAYOUT_GENERAL);
+        // What the first pass saw: tex_in is overwritten by every later pass.
+        nrvk::Context::Image* first = config.max_passes > 1 ? &impl_->shown_keep : &s.tex_in;
+        const std::string stages = (adapters / "pass_stages.spv").string();
+        impl_->to_scratch.create(s.ctx, stages, {}, 16, {&s.surf0, first, &impl_->stage_scratch});
+        impl_->from_scratch.create(s.ctx, stages, {}, 16, {&impl_->stage_scratch, first, &s.surf0});
+        impl_->alpha_scratch.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12,
+                                    {&impl_->stage_scratch, first});
     }
     // The alpha pass restores the frame's own alpha onto the answer: the answer
     // is full_out when scaled, and the frame's alpha lives wherever the frame
@@ -1610,7 +1637,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the network only the write-back touches the frame.
     const bool colour_direct =
         NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && !impl_->prep && engine &&
-        temporal && !mask && passes == 1 &&
+        temporal && !mask && passes == 1 && !impl_->pass_stages &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
         (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh &&
         (!engine->depth.image || (engine->depth.format == VK_FORMAT_R32_SFLOAT &&
@@ -2010,6 +2037,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // store[k] is copied into the bound history image before the pass and
     // the model's write (surf1) copied back after it. With one pass the
     // history round trip is the single copy it always was.
+    bool in_scratch = false;  // dlsslop-amd: the answer is in the stage scratch
     for (uint32_t pass = 0; pass < passes; ++pass) {
         if (pass > 0 && impl_->cascade_detail) {
             // Detail only: the first pass's input with the previous pass's
@@ -2034,7 +2062,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             compute_barrier(cmd);
             if (temporal) copy_general(impl_->history_store[pass], t.history);
         } else if (pass > 0) {
-            barrier(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            const VkImage answer = in_scratch ? impl_->stage_scratch.handle : s.surf0.handle;
+            barrier(cmd, answer, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2043,12 +2072,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             VkImageCopy c{};
             c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             c.extent = {nw, nh, 1};
-            vkCmdCopyImage(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vkCmdCopyImage(cmd, answer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
             barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            barrier(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            barrier(cmd, answer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             if (temporal) copy_general(impl_->history_store[pass], t.history);
@@ -2120,6 +2149,20 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         }
+        // dlsslop-amd: its stages on this pass's answer, before the next pass
+        // or the write-back takes it: one dispatch for each active one.
+        in_scratch = false;
+        if (impl_->pass_stages) {
+            const struct { float strength; uint32_t anchor; } stages[] = {{c.sharpness, 0u}, {c.colour_preserve, 1u}};
+            for (const auto& stage : stages) {
+                if (stage.strength == 0) continue;
+                struct { uint32_t w, h; float strength; uint32_t anchor; } push{nw, nh, stage.strength, stage.anchor};
+                dispatch(cmd, in_scratch ? impl_->from_scratch : impl_->to_scratch, (nw + 7) / 8, (nh + 7) / 8, 1,
+                         &push, sizeof push);
+                compute_barrier(cmd);
+                in_scratch = !in_scratch;
+            }
+        }
     }
     if (temporal) {
         // Leave the bound history holding the FIRST pass's, which is what the
@@ -2180,10 +2223,13 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             dispatch(cmd, transfer, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push);
             compute_barrier(cmd);
         }
-        const VkImage out = impl_->scaled ? impl_->full_out.handle : s.surf0.handle;
+        const VkImage out = impl_->scaled ? impl_->full_out.handle
+                            : in_scratch  ? impl_->stage_scratch.handle
+                                          : s.surf0.handle;
         const uint32_t extent[] = {frame.width, frame.height, uint32_t(impl_->round_u8)};
         if (!impl_->post_alpha || mask)
-            dispatch(cmd, impl_->alpha, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, extent, sizeof extent);
+            dispatch(cmd, in_scratch ? impl_->alpha_scratch : impl_->alpha, (frame.width + 7) / 8,
+                     (frame.height + 7) / 8, 1, extent, sizeof extent);
         barrier(cmd, out, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
