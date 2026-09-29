@@ -61,10 +61,10 @@ def main():
         glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv')
     for k in MOTION:
-        glslang(a.arch, R / 'shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
+        glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
-        glslang(a.arch, R / 'shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+        glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
     print(f'{out}: {len(pipelines)} network pipelines, {len(table["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME)} runtime')
 
