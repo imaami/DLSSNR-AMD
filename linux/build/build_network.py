@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the Linux network for one GPU architecture from linux/shaders/<arch>/pipelines.json.
 
-    build_network.py <arch> [--out DIR] [--check DIR]
+    build_network.py <arch> [--out DIR] [--check DIR] [--glslang PATH]
 
 Writes (default build/linux/<arch>/network):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
@@ -20,12 +20,13 @@ import sys
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
+GLSLANG = [shutil.which('glslang') or 'glslang']
 RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed']
 MOTION = ['motion_luma', 'motion_estimate']
 
 
 def glslang(arch, src, defines, out):
-    cmd = [str(R / 'toolchain/glslang/bin/glslang'), '-V', '--target-env', 'vulkan1.3',
+    cmd = [GLSLANG[0], '-V', '--target-env', 'vulkan1.3',
            '-I' + str(R / 'linux/shaders' / arch / 'include')]
     cmd += ['-D' + d for d in defines] + [str(src), '-o', str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -38,7 +39,10 @@ def main():
     ap.add_argument('arch')
     ap.add_argument('--out', type=Path)
     ap.add_argument('--check', type=Path)
+    ap.add_argument('--glslang', help='glslang executable (default: glslang on PATH)')
     a = ap.parse_args()
+    if a.glslang:
+        GLSLANG[0] = a.glslang
     table = json.loads((R / 'linux/shaders' / a.arch / 'pipelines.json').read_text())
     out = a.out or R / 'build/linux' / a.arch / 'network'
     if out.exists():
@@ -56,10 +60,10 @@ def main():
         glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv')
     for k in MOTION:
-        glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
+        glslang(a.arch, R / 'shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
-        glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
+        glslang(a.arch, R / 'shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
     print(f'{out}: {len(pipelines)} network pipelines, {len(table["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME)} runtime')
 
