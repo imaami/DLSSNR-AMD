@@ -149,6 +149,11 @@ struct RuntimeConfig {
     // (its linear-HDR encode, or linear_input's own): the preprocess undoes the
     // knee first, so its curve is the only one. False for an SDR frame.
     bool preprocess_unknee = false;
+    // dlsslop-amd: explicit locations instead of `root`'s layout. A nonempty
+    // model_pack selects them: the network's SPIR-V and markers in
+    // network_shaders, with runtime/ and temporal/ below it, and a writable
+    // pipeline cache (empty: none).
+    std::string model_pack, network_shaders, pipeline_cache;
 };
 
 // SDR encoded RGB, source-sized and upright. Accepts RGBA32F and 8-bit RGBA/BGRA

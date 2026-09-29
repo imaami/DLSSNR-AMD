@@ -915,13 +915,16 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     impl_->round_u8 = config.colour_format == VK_FORMAT_R8G8B8A8_UNORM || config.colour_format == VK_FORMAT_R8G8B8A8_SRGB ||
                       config.colour_format == VK_FORMAT_B8G8R8A8_UNORM || config.colour_format == VK_FORMAT_B8G8R8A8_SRGB;
     impl_->colour_format = config.colour_format;
-    const auto root = std::filesystem::canonical(config.root);
+    // dlsslop-amd: explicit locations (RuntimeConfig::model_pack) stand in for
+    // an installed copy whose shaders are network_shaders.
+    const bool given = !config.model_pack.empty();
+    const auto root = std::filesystem::canonical(given ? config.network_shaders : config.root);
     // An installed copy keeps everything it loads in dlssnr-amd/ beside the DLL:
     // the model pack and shaders/ (network, runtime/ passes, temporal/). A
     // development tree has build/ and artifacts/ at its root instead.
-    const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
-    const bool installed = data != root;
-    const auto network_shaders = installed ? data / "shaders" : root / "build";
+    const auto data = !given && std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
+    const bool installed = given || data != root;
+    const auto network_shaders = given ? root : installed ? data / "shaders" : root / "build";
     if (!std::isfinite(config.model_scale) || config.model_scale <= 0.f || config.model_scale > 1.f)
         throw std::invalid_argument("model_scale must be in (0, 1]");
     if (config.max_passes < 1 || config.max_passes > 16)
@@ -1002,11 +1005,12 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--spv-dir", network_shaders.string(),
         "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
-        "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string()};
+        "--pipeline-cache", given ? config.pipeline_cache
+                                  : (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string()};
     // The weights as one file (linux/package/model-tools/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
     if (installed) {
-        const auto pack = data / "dlssnr.bin";
+        const auto pack = given ? std::filesystem::path(config.model_pack) : data / "dlssnr.bin";
         if (!std::filesystem::is_regular_file(pack))
             throw std::runtime_error("missing " + pack.string() + " (run install.sh again)");
         arguments.push_back("--model-pack"); arguments.push_back(pack.string());
@@ -1206,7 +1210,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (temporal_config.enable) {
         auto& t = impl_->temporal;
         const auto shaders = std::filesystem::canonical(temporal_config.shaders.empty()
-            ? (installed ? data / "shaders/temporal" : root / "build/linux/rdna4/network/temporal")
+            ? (given ? network_shaders / "temporal" : installed ? data / "shaders/temporal"
+                                                              : root / "build/linux/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
         require_variant_profile(shaders);
         const auto temporal_rel = shaders.lexically_relative(root);
