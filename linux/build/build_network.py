@@ -21,7 +21,8 @@ from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
 GLSLANG = [shutil.which('glslang') or 'glslang']
-RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed']
+RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_prep', 'runtime_depth', 'cascade_lograt',
+           'cascade_blur', 'cascade_feed', 'pass_stages']
 MOTION = ['motion_luma', 'motion_estimate']
 
 
