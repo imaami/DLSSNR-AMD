@@ -7,7 +7,7 @@ __pycache__/
 /linux/package/*.tar.gz
 /windows/package/*.zip
 /linux/package/DLSSNR-AMD-Vulkan-*/
-/windows/package/DLSSNR-AMD-Windows-*/
+/windows/package/DLSSNR-AMD-Vulkan-Windows-*/
 dlssnr-amd.pipelinecache
 # Never commit NVIDIA's files or anything made from them
 *.dll
