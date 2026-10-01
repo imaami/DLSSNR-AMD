@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # Build the Windows package (64-bit games on the AMD Windows driver):
-#   dlssnr-amd/     the network: model, Windows shaders (windows/build/assemble_product_data.sh)
+#   dlssnr-amd/     the network: Windows shaders (windows/build/assemble_product_data.sh)
+#   model-tools/    dlssnr_extract_model.exe: install.ps1 makes the model from the user's nvngx_dlssnr.dll
 #   dxvk/           D3D9/10/11 -> Vulkan, and the DXGI both translators present through
 #   vkd3d-proton/   D3D12 -> Vulkan
 #   reshade/        ReShade as a Vulkan layer (patched loader beside the game) + our add-on
 #   optiscaler/     the OptiScaler-NR release, extracted, plus our NGX DLLs
 #   install.bat, install.ps1, README.txt
 #
-#   NR_MODEL=dlssnr.bin bash windows/build/build_package.sh [build dir]
+#   [NR_MODEL=dlssnr.bin] bash windows/build/build_package.sh [build dir]
 #
-# The Windows installer does not extract the model, so the package has to carry one: make dlssnr.bin
-# from your own nvngx_dlssnr.dll with linux/package/model-tools/extract_model.sh first.
+# The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
+# install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only).
 #
 # The game has to run on Vulkan for the network to share its device, so every route puts DXVK and
 # vkd3d-proton in the game folder. DXVK's dxgi.dll then owns that name: OptiScaler, normally
 # dxgi.dll itself, loads it as dxgi-original.dll, and ReShade comes in as a Vulkan layer.
 set -euo pipefail
-[[ -f "${NR_MODEL:-}" ]] || { echo "set NR_MODEL to a dlssnr.bin (linux/package/model-tools/extract_model.sh)" >&2; exit 1; }
-model=$(realpath -- "$NR_MODEL")
+model=""
+if [[ -n "${NR_MODEL:-}" ]]; then
+    [[ -f "$NR_MODEL" ]] || { echo "NR_MODEL: no such file: $NR_MODEL" >&2; exit 1; }
+    model=$(realpath -- "$NR_MODEL")
+fi
 cd -- "$(dirname -- "$0")/../.."
 out=$(realpath -m -- "${1:-artifacts/windows/package-build}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
@@ -102,7 +106,15 @@ bash windows/build/build_vulkan_loader.sh > /dev/null
 # ---- package ------------------------------------------------------------------------------------
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
-bash windows/build/assemble_product_data.sh "$pkg" --model "$model"
+if [[ -n "$model" ]]; then
+    bash windows/build/assemble_product_data.sh "$pkg" --model "$model"
+else
+    bash windows/build/assemble_product_data.sh "$pkg"
+fi
+# model-tools/: the extractor install.ps1 runs when the package has no model.
+bash windows/package/model-tools/build_extract_model.sh "$out/extract" > /dev/null
+mkdir -p -- "$pkg/model-tools"
+cp -- "$out/extract/dlssnr_extract_model.exe" "$pkg/model-tools/"
 
 # dxvk/, vkd3d-proton/: the translators, as GE-Proton ships them (PE builds; they run on Windows).
 mkdir -p -- "$pkg/dxvk" "$pkg/vkd3d-proton"
@@ -192,7 +204,7 @@ printf '\xef\xbb\xbf' > "$pkg/README.txt"; sed 's/$/\r/' windows/package/README.
 sed -i 's/$/\r/' "$pkg/install.bat"
 
 # ---- archive ------------------------------------------------------------------------------------
-name="DLSSNR-AMD-Windows-$stamp-x64"
+name="DLSSNR-AMD-Windows-$stamp-preview-x64"
 rm -f -- "$out/$name.zip"
 python3 - "$pkg" "$out/$name.zip" <<'PY'
 import os, sys, zipfile

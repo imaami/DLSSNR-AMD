@@ -6,6 +6,10 @@
 // the SPIR-V is unchanged. Record (8 words): tag, wg.x | wg.y<<16,
 // subgroup | aux<<16, realtime start, end (100 MHz), shader clock start, end,
 // end hi. NR_PROF_END covers the wave's life; NR_PROF_ITEM_* one persistent item.
+#if defined(NR_FRAGDUMP_OFF) && !defined(NR_PROF_OFF)
+// the fragment dump writes into the same region.
+layout(set = 0, binding = 0, std430) coherent buffer NrProfU { uint nr_prof_u[]; };
+#endif
 #ifdef NR_PROF_OFF
 #extension GL_EXT_shader_realtime_clock : require
 #extension GL_ARB_shader_clock : require

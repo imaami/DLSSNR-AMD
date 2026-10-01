@@ -1,12 +1,13 @@
-DLSSNR-AMD (Windows, experimental)
-==================================
+DLSSNR-AMD (Windows, experimental preview)
+==========================================
 
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
-This Windows version is far from finished and is slower than the Linux version. Expect games
-that do not work. The current version has not been tested in any game: there is no guarantee
-that it runs correctly, and getting it to work may need your own testing and code changes.
+This is an experimental preview and has not been tested much: game crashes, driver resets and
+other unexpected problems can happen. It is slower than the Linux version and updated less
+often, and some releases may be Linux only. If something breaks, uninstall with option 4 of
+install.bat.
 
 On Windows the game itself is D3D11/D3D12 and has no Vulkan device, so the installer puts DXVK
 and vkd3d-proton into the game folder: the game runs on Vulkan and NR shares its device.
@@ -31,6 +32,15 @@ games it is under Binaries\Win64, not the launcher outside), then pick a route:
 You can also drag the game's exe onto install.bat. Games under Program Files ask for
 administrator rights.
 
+Model
+-----
+The package does not contain NVIDIA's model. The first install asks for nvngx_dlssnr.dll
+(version 310.8.0 only) or a zip that contains it. The installer extracts the model with
+model-tools\dlssnr_extract_model.exe (it only reads the weight data; the DLL is never loaded or
+run), checks every entry against known hashes and writes dlssnr-amd\dlssnr.bin only if all
+match. The model stays in this package, so later installs from it (into other games too) do not
+ask again; with a newer package, choose the DLL once more or copy that file over.
+
 Use
 ---
 OptiScaler: turn on DLSS (or FSR / XeSS) in the game's graphics settings. Insert opens the
@@ -49,8 +59,10 @@ original look; the result may be better or worse), and games that do not hand th
 to the upscaler, which it fixes (007 First Light turns green and grainy with NR otherwise).
 Ctrl+F10 switches it for the current run, to compare. The file explains every setting.
 
-The first time in game the network has to compile and takes about half a minute to start;
-after that it is cached.
+The first time NR runs in a game the network has to compile; it takes effect after about a
+minute (much longer than on Linux, where it takes 10-20 seconds). Until then the picture looks
+as without NR, which does not mean the mod is not working: give it a minute. After that it is
+cached. This happens once for each game.
 
 Files put into the game folder
 ------------------------------
@@ -74,9 +86,10 @@ Known limits
 - In the ReShade route, overlays such as Steam's may not show; in the OptiScaler route
   overlays are turned off (otherwise the game hangs).
 - DX11 games cannot use the OptiScaler route: for DX11 games OptiScaler hands the picture to
-  the system's D3D12, and on Windows DXVK's picture cannot be shared that way (7 Days to Die
-  fails once a map loads). Use the ReShade route.
-- Final Fantasy XIV: crashes together with Dalamud (plugin frameworks); turn Dalamud off first.
+  the system's D3D12, and on Windows DXVK's picture cannot be shared that way. Use the ReShade
+  route.
+- Games whose FSR runs in their own shaders never hand it to OptiScaler: pick the game's DLSS
+  option instead, which OptiScaler offers.
 - When video memory or system memory (including virtual memory) runs short, the network pauses
   by itself and the picture returns to normal until memory frees up. Set the page file to
   "System managed size".

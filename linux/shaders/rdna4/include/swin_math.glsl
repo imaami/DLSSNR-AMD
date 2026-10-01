@@ -88,9 +88,25 @@ f16vec2 nr_swin_exp2(vec2 x) {
 // field, and that is one `v_lshl_add_u32`: (0x3C00+m)<<5 = 0x78000 + 32m per
 // half, and the high half's field leaves 0x80000000 after the 32-bit wrap.
 // Bit-identical for every clamped value; one instruction instead of two.
+#ifndef NR_EXP_NOHI
+#define NR_EXP_NOHI 0
+#endif
 f16vec2 nr_swin_exp_baked(vec2 x, vec2 bias) {
+#if NR_EXP_NOHI
+    // the layer's weights bound every logit so the upper clamp is never
+    // reached (host audit: baked bias + 0.044921875*1.2*|scale| <= 1.5693359375);
+    // max alone is the same function there.
+    const f16vec2 y=max(f16vec2(fma(x,vec2(0.044921875),bias)),f16vec2(1.03125hf));
+#else
     const f16vec2 y=clamp(f16vec2(fma(x,vec2(0.044921875),bias)),
                          f16vec2(1.03125hf),f16vec2(1.5693359375hf));
+#endif
+    const uint h=packFloat2x16(y);
+    return unpackFloat2x16((h<<5u)+0x7FF88000u);
+}
+// the same exponential for a head whose inputs never reach the upper clamp.
+f16vec2 nr_swin_exp_baked_nohi(vec2 x, vec2 bias) {
+    const f16vec2 y=max(f16vec2(fma(x,vec2(0.044921875),bias)),f16vec2(1.03125hf));
     const uint h=packFloat2x16(y);
     return unpackFloat2x16((h<<5u)+0x7FF88000u);
 }

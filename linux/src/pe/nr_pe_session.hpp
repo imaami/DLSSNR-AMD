@@ -106,9 +106,14 @@ class Session {
     // the network's cost tracks the resolution it runs at. Engine motion vectors
     // still come from the same call, at render resolution; the shader samples
     // them by normalized coordinate, so the resolutions need not match.
+    // `input` (optional): read the colour from there and write the answer into
+    // `output`, which then needs no seed copy of it. Returns false without
+    // recording anything when that is not possible (the caller seeds and runs in
+    // place instead): different formats or extents, or the model not applied.
     bool run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                    ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
-                   const EngineResources& resources, const Controls& controls);
+                   const EngineResources& resources, const Controls& controls,
+                   ID3D12Resource* input = nullptr, D3D12_RESOURCE_STATES input_state = D3D12_RESOURCE_STATE_COMMON);
 
     // D3D11, through DXVK. There is no command list to record into, so this one
     // owns a command buffer, records into it, and submits it on DXVK's own queue
@@ -178,6 +183,11 @@ class Session {
         bool reset{};
         bool upscaler_input{};   // as D3D11Frame::upscaler_input
         bool linear_hdr{};       // as D3D11Frame::linear_hdr
+        // The caller's output (optional): the network reads `colour` in place and writes
+        // here, and run_vulkan returns it - no copy into an image of ours and back.
+        // `output_usage` / `colour_usage` as far as the caller's descriptors say.
+        VkImage output{}; VkImageLayout output_layout{VK_IMAGE_LAYOUT_GENERAL};
+        VkImageUsageFlags output_usage{}, colour_usage{};
     };
     // A Vulkan game's own queue. The two D3D runtimes have an interop object to
     // ask for one; a Vulkan game has nothing of the sort, so the queue is learned
@@ -186,7 +196,8 @@ class Session {
     void set_vulkan_queue(VkQueue queue, uint32_t family);
 
     // Returns the image to hand the upscaler in place of the game's colour, or
-    // null when the pass could not run.
+    // null when the pass could not run. With VulkanFrame::output set it is that
+    // image when the answer went straight into it.
     VkImage run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
                        const VulkanFrame& frame, const Controls& controls);
     // The universal fallback: the frame exactly as it is about to be shown, in

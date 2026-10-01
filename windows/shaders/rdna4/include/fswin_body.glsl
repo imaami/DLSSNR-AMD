@@ -66,7 +66,7 @@
     for(int n=0;n<2;++n) {
         NR_FRAG_ACC16 half_result;
         for(int j=0;j<8;++j)half_result[j]=NR_F16(uacc[n][j]);
-        NR_STORE_ACC_COL(half_result,ups_projected,uint(n)*256u,16u);
+        NR_UPS_STORE(half_result,uint(n)*256u);
     }
 #else
     for(int k=0;k<4;++k)
@@ -81,7 +81,7 @@
         }
         NR_FRAG_ACC16 half_result;
         for(int j=0;j<8;++j)half_result[j]=NR_F16(acc[j]);
-        NR_STORE_ACC_COL(half_result,ups_projected,uint(n)*256u,16u);
+        NR_UPS_STORE(half_result,uint(n)*256u);
     }
 #endif
     barrier();
@@ -123,7 +123,7 @@
         const uint nf=uint(nrhw_h*NR_DF+n);
         NR_FRAG_ACC16 half_result;
         for(int j=0;j<8;++j)half_result[j]=NR_F16(uacc[n][j]);
-        NR_STORE_ACC_COL(half_result,ups_projected,nf*256u,16u);
+        NR_UPS_STORE(half_result,nf*256u);
     }
 #else
     for(int k=0;k<2*NR_CF;++k)
@@ -162,7 +162,7 @@
         }
         NR_FRAG_ACC16 half_result;
         for(int j=0;j<8;++j)half_result[j]=NR_F16(acc[j]);
-        NR_STORE_ACC_COL(half_result,ups_projected,nf*256u,16u);
+        NR_UPS_STORE(half_result,nf*256u);
     }
 #endif
     barrier();
@@ -172,6 +172,7 @@
 #endif
 
     // ---- stage 1: e = act(E . x) -----------------------------------------
+    NR_PROF_STAGE(1)
     // x is the B operand and never leaves registers; the MLP residual reads the
     // same fragments later.
     // The tile each token fragment lives in. In window-major mode this is the
@@ -252,10 +253,13 @@
                 for(int j=0;j<8;j+=2) {
                     const uint ch=k*16u+rbase+uint(j);
                     const uint pb=k*256u+local_slot*16u+rbase+uint(j);
-                    const f16vec2 pv2=f16vec2(ups_projected[pb],ups_projected[pb+1u]);
-                    const f16vec2 sv2=unpackFloat2x16(packHalf2x16(vec2(
-                        float(sv4[j/4][j%4]), float(sv4[j/4][j%4+1]))));
+                    const f16vec2 pv2=NR_UPS_PAIR(pb);
+                    const f16vec2 sv2=unpackFloat2x16(packHalf2x16(nr_e4f2_pick(vec4(sv4[j/4]),j%4)));
+#if NR_BLEND_G32
+                    const f16vec2 g2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+ch)>>1u]);
+#else
                     const f16vec2 g2=f16vec2(wgt_f16[pc.blend_g_off+ch],wgt_f16[pc.blend_g_off+ch+1u]);
+#endif
                     const fe4m3vec2 qv=nr_quant_pair(fma(sv2,g2,pv2));
                     src[j]=qv.x; src[j+1]=qv.y;
                 }
@@ -268,7 +272,7 @@
                 const uint ch=k*16u+rbase+uint(j);
 #ifdef NR_WIDE_UPS_PROJECT
                 const uint local_slot=((q>>1u)*2u+dy/2u)*4u+(q&1u)*2u+dx/2u;
-                NR_F16 pv=ups_projected[k*256u+local_slot*16u+rbase+uint(j)];
+                NR_F16 pv=NR_UPS_ONE(k*256u+local_slot*16u+rbase+uint(j));
 #else
                 NR_F16 pv=act_f16[pc.blend_p_off/2u+(itile*uint(NR_CF)+k)*256u+islot*16u+rbase+uint(j)];
 #endif
@@ -328,13 +332,12 @@
 #ifdef NR_FUSED_UPS_PROJECT
                     const uint local_slot=((q>>1u)*2u+dy/2u)*4u+(q&1u)*2u+dx/2u;
                     const uint pb=uint(k)*256u+local_slot*16u+rbase+uint(j);
-                    const f16vec2 pv2=f16vec2(ups_projected[pb],ups_projected[pb+1u]);
+                    const f16vec2 pv2=NR_UPS_PAIR(pb);
 #else
                     const uint pb=pc.blend_p_off/2u+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase+uint(j);
                     const f16vec2 pv2=f16vec2(act_f16[pb],act_f16[pb+1u]);
 #endif
-                    const f16vec2 sv2=unpackFloat2x16(packHalf2x16(vec2(
-                        float(sv4[j/4][j%4]), float(sv4[j/4][j%4+1]))));
+                    const f16vec2 sv2=unpackFloat2x16(packHalf2x16(nr_e4f2_pick(vec4(sv4[j/4]),j%4)));
 #if NR_BLEND_G32
                     const f16vec2 g2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+ch)>>1u]);
 #else
@@ -350,7 +353,7 @@
                 const uint ch=uint(k)*16u+rbase+uint(j);
 #ifdef NR_FUSED_UPS_PROJECT
                 const uint local_slot=((q>>1u)*2u+dy/2u)*4u+(q&1u)*2u+dx/2u;
-                NR_F16 pv=ups_projected[uint(k)*256u+local_slot*16u+rbase+uint(j)];
+                NR_F16 pv=NR_UPS_ONE(uint(k)*256u+local_slot*16u+rbase+uint(j));
 #else
                 NR_F16 pv=act_f16[pc.blend_p_off/2u+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase+uint(j)];
 #endif
@@ -390,10 +393,8 @@
             // round-toward-zero pair pack loses nothing.
             for(int j=0;j<8;j+=2) {
                 const uint ch=uint(k)*16u+rbase+uint(j);
-                const f16vec2 pv2=unpackFloat2x16(packHalf2x16(vec2(
-                    float(pv4[j/4][j%4]), float(pv4[j/4][j%4+1]))));
-                const f16vec2 sv2=unpackFloat2x16(packHalf2x16(vec2(
-                    float(sv4[j/4][j%4]), float(sv4[j/4][j%4+1]))));
+                const f16vec2 pv2=unpackFloat2x16(packHalf2x16(nr_e4f2_pick(vec4(pv4[j/4]),j%4)));
+                const f16vec2 sv2=unpackFloat2x16(packHalf2x16(nr_e4f2_pick(vec4(sv4[j/4]),j%4)));
 #if NR_BLEND_G32
                 const f16vec2 gm2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+uint(NR_C)+ch)>>1u]);
                 const f16vec2 gs2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+ch)>>1u]);
@@ -519,6 +520,94 @@
         // of LDS. Processing h in pairs halves the loads: 4 loads and 8 MMAs a
         // k step where it was 4 and 4. The accumulators double to 8 (64 VGPRs).
         // Same k order into each accumulator, so the arithmetic is unchanged.
+#if NR_ESPLIT
+        // Windows (LLPC) NR_ESPLIT: the expansion over the token fragments in two halves, half the
+        // accumulators live (LLVM hoists every k step's loads ahead of the first WMMA, so this was
+        // the register peak of the DS runs). Each accumulator sees the same k order; the weight
+        // pairs are read once a half.
+        for (int h = 0; h < NR_HGF; h += NR_EXPAND_GROUP) {
+        for (int mh = 0; mh < NR_MF; mh += NR_MF / 2) {
+            NR_ACCF a[NR_EXPAND_GROUP][NR_MF];
+            for (int p = 0; p < NR_EXPAND_GROUP; ++p)
+                for (int m = mh; m < mh + NR_MF / 2; ++m) a[p][m] = NR_ACCZERO;
+            for (int k = 0; k < NR_CF; ++k) {
+                NR_FRAG_B xbk[NR_MF];
+                for (int m = mh; m < mh + NR_MF / 2; ++m)
+                    NR_LOAD_B(xbk[m], lds_x, NR_LXB_
+                              uint(m * NR_CF + k) * 256u + NR_OPQ(1u + uint(h)), 16u);
+#if defined(NR_PACKED_EXPAND)
+#if NR_ACC_F16 != 0 || NR_F16_MMA
+#error "paired expansion weights require FP32 with FP8 operands"
+#endif
+                for(int p=0;p<NR_EXPAND_GROUP;p+=2) {
+                    const uint q=pc.e_off/4u + uint((g*NR_HGF+h+p)/2)*uint(NR_CF)*128u
+                        + uint(k)*128u + lane*4u;
+                    NR_OPA wf0,wf1;
+                    { NR_WPAIR_FILL2S(wf0,wf1,q,1) }
+                    for(int m=mh;m<mh+NR_MF/2;++m) NR_MG(m) NR_MMA(a[p][m],wf0,xbk[m]);
+                    for(int m=mh;m<mh+NR_MF/2;++m) NR_MG(m) NR_MMA(a[p+1][m],wf1,xbk[m]);
+                }
+#else
+                for (int p = 0; p < NR_EXPAND_GROUP; ++p) {
+                    NR_OPA wf;
+                    NR_LOAD_WA(wf,
+                              NR_TILE(pc.e_off, uint(g * NR_HGF + h + p) * 16u,
+                                      uint(k) * 16u, uint(NR_C)), 16u);
+                    for (int m = mh; m < mh + NR_MF / 2; ++m) NR_MMA(a[p][m], wf, xbk[m]);
+                }
+#endif
+                if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
+                    for (int p = 0; p < NR_EXPAND_GROUP; ++p)
+                        for (int m = mh; m < mh + NR_MF / 2; ++m) NR_RND(a[p][m])
+            }
+            for (int p = 0; p < NR_EXPAND_GROUP; ++p)
+            for (int m = mh; m < mh + NR_MF / 2; ++m) NR_MG(m)
+#if NR_ACTIVATION_LUT
+                for(int c=0;c<8;c+=2) {
+                    const fe4m3vec2 qp=nr_act_lookup(NR_N2_EQ(a[p][m][c],a[p][m][c+1]));
+                    eqg[m][h+p][c]=qp.x;eqg[m][h+p][c+1]=qp.y;
+                }
+#elif NR_ACT_F32
+                for (int c = 0; c < 8; c += 2) {
+                    const fe4m3vec2 qp = nr_quant_pair32(vec2(
+                        NR_ACTP(a[p][m][c], c), NR_ACTP_B(a[p][m][c + 1], c + 1)));
+                    eqg[m][h + p][c] = qp.x;
+                    eqg[m][h + p][c + 1] = qp.y;
+                }
+#elif NR_ACT_PACKED
+#if NR_QBATCH_ON
+                NR_QBLOCK8(eqg[m][h + p], a[p][m])
+#else
+                for (int c = 0; c < 8; c += 2) {
+                    const f16vec2 v = nr_act2(NR_N2_EQ(a[p][m][c],
+                                                       a[p][m][c + 1]));
+#if NR_QUANT_PAIRED
+                    fe4m3vec2 qp = nr_quant_pair(v);
+                    eqg[m][h + p][c] = qp.x;
+                    eqg[m][h + p][c + 1] = qp.y;
+#else
+                    eqg[m][h + p][c]     = nr_quant_e4m3(v.x);
+                    eqg[m][h + p][c + 1] = nr_quant_e4m3(v.y);
+#endif
+                }
+#endif
+#else
+#if NR_QUANT_PAIRED
+                for (int c = 0; c < 8; c += 2) {
+                    fe4m3vec2 qp = nr_quant_pair(f16vec2(
+                        NR_F16(nr_act(a[p][m][c])),
+                        NR_F16(nr_act(a[p][m][c + 1]))));
+                    eqg[m][h + p][c] = qp.x;
+                    eqg[m][h + p][c + 1] = qp.y;
+                }
+#else
+                for (int c = 0; c < 8; ++c)
+                    eqg[m][h + p][c] = nr_quant_e4m3(NR_F16(nr_act(a[p][m][c])));
+#endif
+#endif
+        }
+        }
+#else
         for (int h = 0; h < NR_HGF; h += NR_EXPAND_GROUP) {
             NR_ACCF a[NR_EXPAND_GROUP][NR_MF];
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
@@ -535,20 +624,15 @@
                 for(int p=0;p<NR_EXPAND_GROUP;p+=2) {
                     const uint q=pc.e_off/4u + uint((g*NR_HGF+h+p)/2)*uint(NR_CF)*128u
                         + uint(k)*128u + lane*4u;
-                    const fe4m3vec4 w0=wexpand_pair4[q],w1=wexpand_pair4[q+1u];
-                    const fe4m3vec4 w2=wexpand_pair4[q+2u],w3=wexpand_pair4[q+3u];
                     NR_OPA wf0,wf1;
-                    for(int v=0;v<4;++v) {
-                        wf0[v]=w0[v]; wf0[v+4]=w1[v];
-                        wf1[v]=w2[v]; wf1[v+4]=w3[v];
-                    }
+                    { NR_WPAIR_FILL2S(wf0,wf1,q,1) }
                     for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(a[p][m],wf0,xbk[m]);
                     for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(a[p+1][m],wf1,xbk[m]);
                 }
 #else
                 for (int p = 0; p < NR_EXPAND_GROUP; ++p) {
                     NR_OPA wf;
-                    NR_LOAD_A(wf, NR_WARENA,
+                    NR_LOAD_WA(wf,
                               NR_TILE(pc.e_off, uint(g * NR_HGF + h + p) * 16u,
                                       uint(k) * 16u, uint(NR_C)), 16u);
                     for (int m = 0; m < NR_MF; ++m) NR_MMA(a[p][m], wf, xbk[m]);
@@ -604,6 +688,7 @@
 #endif
 #endif
         }
+#endif
 #else
         for (int h = 0; h < NR_HGF; ++h) {
             NR_ACCF a[NR_MF];
@@ -616,7 +701,7 @@
 #endif
                 // One weight fragment, NR_MF products: the point of widening M.
                 NR_OPA wf;
-                NR_LOAD_A(wf, NR_WARENA,
+                NR_LOAD_WA(wf,
                           NR_TILE(pc.e_off, uint(g * NR_HGF + h) * 16u, uint(k) * 16u,
                                   uint(NR_C)), 16u);
                 for (int m = 0; m < NR_MF; ++m) NR_MMA(a[m], wf, NR_XB(m, k));
@@ -676,7 +761,7 @@
         for(int n=0;n<NR_DF;++n) for(int m=0;m<NR_MF;++m) nr_mid_acc[n][m]=NR_ACCZERO;
         for(int k=0;k<NR_HGF;++k) {
             NR_OPA wf0,wf1;
-            NR_WEIGHT_PAIR(wf0,wf1,pc.mid_off,uint(g*NR_DF),uint(k),uint(NR_HGF))
+            NR_WEIGHT_PAIR_S(wf0,wf1,pc.mid_off,uint(g*NR_DF),uint(k),uint(NR_HGF),2)
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[0][m],wf0,eqg[m][k]);
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[1][m],wf1,eqg[m][k]);
         }
@@ -700,7 +785,7 @@
             for (int m = 0; m < NR_MF; ++m) a[m] = NR_ACCZERO;
             for (int k = 0; k < NR_HGF; ++k) {
                 NR_OPA wf;
-                NR_LOAD_A(wf, NR_WARENA,
+                NR_LOAD_WA(wf,
                           NR_TILE(pc.mid_off, uint(nf) * 16u, uint(k) * 16u,
                                   uint(NR_HG)), 16u);
                 for (int m = 0; m < NR_MF; ++m) NR_MMA(a[m], wf, eqg[m][k]);
@@ -853,6 +938,7 @@
     barrier(); // All lookup readers retire before K/V overwrite the table.
 #endif
     // ---- stage 2: y = Ct . q(e or m) + rs * x -----------------------------
+    NR_PROF_STAGE(2)
 #if NR_HWAVES
     // **No `yq` array at all.** The rows this wave owns go into `lds_x` at the
     // end of stage 2 and the output projection reloads them from there, so the
@@ -920,7 +1006,7 @@
             for(int c=0;c<8;c+=2) {
                 const uint off=pc.rs_off+uint(n)*16u+rbase+uint(c);
 #if NR_RESIDUAL_F32
-                const vec2 residual=vec2(yr[c],yr[c+1])*vec2(wgt_f32[off],wgt_f32[off+1u]);
+                const vec2 residual=NR_E4F2(yr,c)*vec2(wgt_f32[off],wgt_f32[off+1u]);
 #else
                 const f16vec2 scale=nr_residual_scale(off);
                 const f16vec2 residual=f16vec2(yr[c],yr[c+1])*scale;
@@ -935,7 +1021,7 @@
         for(int m=0;m<NR_MF;++m)
             NR_LOAD_B(ctx[m],lds_y, NR_LXB_ uint(m*NR_CF+k)*256u+NR_OPQ(64u),16u);
         NR_OPA wf0,wf1;
-        NR_WEIGHT_PAIR(wf0,wf1,pc.ct_off,uint(nrhw_h*NR_DF),uint(k),uint(NR_KCF))
+        NR_WEIGHT_PAIR_S(wf0,wf1,pc.ct_off,uint(nrhw_h*NR_DF),uint(k),uint(NR_KCF),4)
         for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_contract_acc[0][m],wf0,ctx[m]);
         for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_contract_acc[1][m],wf1,ctx[m]);
     }
@@ -973,7 +1059,7 @@
 #ifdef NR_INPUT_F16
             const vec2 x=vec2(xh[m][n][c],xh[m][n][c+1]);
 #else
-            const vec2 x=vec2(NR_XB(m,n)[c],NR_XB(m,n)[c+1]);
+            const vec2 x=NR_E4F2(NR_XB(m,n),c);
 #endif
             const uint off=pc.rs_off+uint(n)*16u+rbase+uint(c);
             const vec2 residual=x*vec2(wgt_f32[off],wgt_f32[off+1u]);
@@ -1131,13 +1217,14 @@
 #else
         for (int c = 0; c < 8; ++c) d[c] = nr_quant_e4m3(NR_F16(NR_Y(m, n, c)));
 #endif
-        NR_STORE_ACC_COL(d, act_e4m3, pc.o_off + wbase
+        NR_STORE_ACT_COL(d, pc.o_off + wbase
                          + (tok0 + uint(m) * 16u) * uint(NR_C) + uint(n) * 16u, uint(NR_C));
     }
     return;
 #endif
 
     // ---- stages 3 to 5: QKV, attention and context, one head at a time ---
+    NR_PROF_STAGE(3)
     // The QKV rows are grouped **per head**, [Q|K|V] each, not [all Q][all K]
     // [all V]: the host reduces from `g * 3 * hd`. The two orders coincide at
     // one head, which is why C=32 could not tell them apart and C=64 scored
@@ -1207,7 +1294,7 @@
 #endif
                 for(int r=0;r<NR_QK_ROWS;r+=2) {
                     NR_OPA wf0,wf1;
-                    NR_WEIGHT_PAIR(wf0,wf1,pc.qkv_off,uint(hh*3*NR_DF+0+r),uint(k),uint(NR_CF))
+                    NR_WEIGHT_PAIR_S(wf0,wf1,pc.qkv_off,uint(hh*3*NR_DF+0+r),uint(k),uint(NR_CF),8)
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r],wf0,yk[m]);
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r+1],wf1,yk[m]);
                 }
@@ -1221,6 +1308,7 @@
                 if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m)
                         for (int r = 0; r < NR_QK_ROWS; ++r) NR_RND(acc[m][r])
+                NR_KFENCE(8)
             }
             for (int m = 0; m < NR_MF; ++m) NR_MGA(m) {
 #if NR_NORM_F32
@@ -1304,7 +1392,7 @@
                               uint(m * NR_CF + k) * 256u + NR_OPQ(129u), 16u);
                 for (int r = 0; r < NR_DF; ++r) {
                     NR_OPA wf;
-                    NR_LOAD_A(wf, NR_WARENA,
+                    NR_LOAD_WA(wf,
                               NR_TILE(pc.qkv_off,
                                       uint(hh * 3 * NR_DF + NR_DF + r) * 16u,
                                       uint(k) * 16u, uint(NR_C)), 16u);
@@ -1376,6 +1464,37 @@
                 }
             }
             // ---- pass V: rows [hh*3*NR_DF + 2*NR_DF, +NR_DF) ----
+#if NR_V_SWAP && NR_VPASS_SPLIT
+            // Windows (LLPC) NR_VPASS_SPLIT: the V pass over the token fragments in two halves,
+            // four accumulators live instead of eight (LLVM hoists every k step's fragment loads
+            // ahead of the first WMMA, so the pass was the register peak). Each accumulator sees
+            // the same k order; the weight pairs are read once a half.
+            for (int mh = 0; mh < NR_MF; mh += NR_MF / 2) {
+                for (int m = mh; m < mh + NR_MF / 2; ++m)
+                    for (int d = 0; d < NR_DF; ++d) acc[m][d] = NR_ACCZERO;
+                for (int k = 0; k < NR_CF; ++k) {
+                    NR_FRAG_A yka[NR_MF];
+                    for (int m = mh; m < mh + NR_MF / 2; ++m)
+                        NR_LOAD_A(yka[m], lds_x, NR_LXB_
+                                  uint(m * NR_CF + k) * 256u + NR_OPQ(130u), 16u);
+                    for(int r=0;r<NR_DF;r+=2) {
+                        NR_FRAG_B wb0,wb1;
+                        NR_WEIGHT_PAIR_S(wb0,wb1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF),16)
+                        for(int m=mh;m<mh+NR_MF/2;++m) NR_MGA(m) NR_MMA(acc[m][r],yka[m],wb0);
+                        for(int m=mh;m<mh+NR_MF/2;++m) NR_MGA(m) NR_MMA(acc[m][r+1],yka[m],wb1);
+                    }
+                }
+                for (int m = mh; m < mh + NR_MF / 2; ++m) NR_MGK(m)
+                    for (int d = 0; d < NR_DF; ++d)
+                        for (int c = 0; c < 8; c += 2) {
+                            fe4m3vec2 qp = nr_quant_pair(NR_N2_V(
+                                acc[m][d][c],
+                                acc[m][d][c + 1]));
+                            vreg[d][m][c] = qp.x;
+                            vreg[d][m][c + 1] = qp.y;
+                        }
+            }
+#else
             for (int m = 0; m < NR_MF; ++m)
                 for (int d = 0; d < NR_DF; ++d) acc[m][d] = NR_ACCZERO;
             for (int k = 0; k < NR_CF; ++k) {
@@ -1393,7 +1512,7 @@
                               uint(m * NR_CF + k) * 256u + NR_OPQ(130u), 16u);
                 for(int r=0;r<NR_DF;r+=2) {
                     NR_FRAG_B wb0,wb1;
-                    NR_WEIGHT_PAIR(wb0,wb1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF))
+                    NR_WEIGHT_PAIR_S(wb0,wb1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF),16)
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r],yka[m],wb0);
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r+1],yka[m],wb1);
                 }
@@ -1408,14 +1527,14 @@
 #endif
                 for(int r=0;r<NR_DF;r+=2) {
                     NR_OPA wf0,wf1;
-                    NR_WEIGHT_PAIR(wf0,wf1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF))
+                    NR_WEIGHT_PAIR_S(wf0,wf1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF),16)
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r],wf0,yk[m]);
                     for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(acc[m][r+1],wf1,yk[m]);
                 }
 #else
                 for (int r = 0; r < NR_DF; ++r) {
                     NR_OPA wf;
-                    NR_LOAD_A(wf, NR_WARENA,
+                    NR_LOAD_WA(wf,
                               NR_TILE(pc.qkv_off,
                                       uint(hh * 3 * NR_DF + 2 * NR_DF + r) * 16u,
                                       uint(k) * 16u, uint(NR_C)), 16u);
@@ -1426,6 +1545,7 @@
                 if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m)
                         for (int r = 0; r < NR_DF; ++r) NR_RND(acc[m][r])
+                NR_KFENCE(16)
             }
 #if NR_V_SWAP
             for (int m = 0; m < NR_MF; ++m) NR_MGK(m)
@@ -1452,9 +1572,10 @@
                     // stored ColumnMajor at stride 16 is read back ColumnMajor
                     // as an A operand that is [dim][token], which is what the
                     // context product wants. Nothing crosses a wave.
-                    NR_STORE_ACC_COL(vf, lds_y, NR_LXB_
+                    NR_V_LDS_STORE(vf, lds_y, NR_LXB_
                                      uint(m * NR_CF + hh * NR_DF + d) * 256u, 16u);
                 }
+#endif
 #endif
         }
 #else
@@ -1726,7 +1847,7 @@
                 // ColumnMajor at stride 16 is read back ColumnMajor as an A
                 // operand that is [dim][token], which is what the context
                 // product wants. Nothing crosses a wave, so no barrier.
-                NR_STORE_ACC_COL(vf, lds_y, NR_LXB_
+                NR_V_LDS_STORE(vf, lds_y, NR_LXB_
                                  uint(m * NR_CF + hh * NR_DF + d) * 256u, 16u);
 #elif NR_V_SWAP && !NR_V_REGS
                 NR_STORE_ACC_COL(vf, lds_v, NR_V_LDS_OFFSET + uint(d) * 16u * uint(NR_WIN) + t0, uint(NR_WIN));
@@ -1740,6 +1861,7 @@
         barrier();
 #endif
 
+        NR_PROF_STAGE_LAST(4)
         // S^T = K . Q^T, so K is the A operand straight out of LDS and Q^T is
         // the B operand straight out of the QKV accumulator. The accumulator's
         // rows are the *key* tokens, which is what makes the softmax
@@ -1821,7 +1943,9 @@
                     // they did not before (the P column of the ledger is a
                     // C=32 measurement and C=32 is the one width with no head
                     // split).
-#if NR_PROB_BOUNDED && NR_PROB_PK
+#if NR_PROB_BOUNDED && NR_PROB_PK == 2
+                    fe4m3vec2 q = fe4m3vec2(vec2(pq2[j][c]) * inv);
+#elif NR_PROB_BOUNDED && NR_PROB_PK
                     fe4m3vec2 q = fe4m3vec2(pq2[j][c] * f16vec2(NR_F16(inv)));
 #elif NR_PROB_BOUNDED
                     fe4m3vec2 q = fe4m3vec2(NR_N2_P(x,y));
@@ -1960,7 +2084,9 @@
 #else
                 float x=float(pq2[m][j][c].x)*inv;
                 float y=float(pq2[m][j][c].y)*inv;
-#if NR_PROB_BOUNDED && NR_PROB_PK
+#if NR_PROB_BOUNDED && NR_PROB_PK == 2
+                NR_PV_QT q=fe4m3vec2(vec2(pq2[m][j][c]) * inv);
+#elif NR_PROB_BOUNDED && NR_PROB_PK
                 NR_PV_QT q=fe4m3vec2(pq2[m][j][c] * f16vec2(NR_F16(inv)));
 #elif NR_PROB_BOUNDED
                 NR_PV_QT q=fe4m3vec2(NR_N2_P(x,y));
@@ -2011,6 +2137,7 @@
 #endif
         }
 #endif
+        NR_PROF_STAGE_LAST(5)
         // ctx^T = V^T . P^T; this head's output occupies channel fragments
         // [hh*NR_DF, (hh+1)*NR_DF) of the concatenated C rows.
         for (int e = 0; e < NR_DF; ++e) {
@@ -2021,7 +2148,7 @@
 #if NR_V_REGS
                 vf = vreg[e][j];
 #elif NR_HWAVES
-                NR_LOAD_A_COL(vf, lds_y, NR_LXB_
+                NR_V_LDS_LOAD(vf, lds_y, NR_LXB_
                               uint(j * NR_CF + hh * NR_DF + e) * 256u
                               + NR_OPQ(192u), 16u);
 #else
@@ -2089,6 +2216,7 @@
                   (tok0+uint(m)*16u)*uint(NR_C)+uint(k)*16u, uint(NR_C));
 #endif
     // ---- stage 6: the output projection and the attention skip ------------
+    NR_PROF_STAGE(6)
 #if NR_IMGOUT_REGS
     // One RGB triple per token *pair* of fragments, summed across the n loop in
     // the original's channel order. `nr_io_lo` picks which of the pair a lane
@@ -2166,7 +2294,7 @@
             for(int c=0;c<8;c+=2) {
                 const uint off=pc.ars_off+uint(n)*16u+rbase+uint(c);
 #if NR_RESIDUAL_F32
-                const vec2 residual=vec2(yr[c],yr[c+1])*vec2(wgt_f32[off],wgt_f32[off+1u]);
+                const vec2 residual=NR_E4F2(yr,c)*vec2(wgt_f32[off],wgt_f32[off+1u]);
 #else
                 const f16vec2 scale=nr_residual_scale(off);
                 const f16vec2 residual=f16vec2(yr[c],yr[c+1])*scale;
@@ -2181,7 +2309,7 @@
         for(int m=0;m<NR_MF;++m)
             NR_LOAD_B(ctx[m],lds_y, NR_LXB_ uint(m*NR_CF+k)*256u+NR_OPQ(64u),16u);
         NR_OPA wf0,wf1;
-        NR_WEIGHT_PAIR(wf0,wf1,pc.op_off,uint(nrhw_h*NR_DF),uint(k),uint(NR_CF))
+        NR_WEIGHT_PAIR_S(wf0,wf1,pc.op_off,uint(nrhw_h*NR_DF),uint(k),uint(NR_CF),32)
         for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(nr_project_acc[0][m],wf0,ctx[m]);
         for(int m=0;m<NR_MF;++m) NR_MGA(m) NR_MMA(nr_project_acc[1][m],wf1,ctx[m]);
     }
@@ -2669,11 +2797,11 @@
             // `tile_blocked`'s `(r%16)*16 + (k%16)`.
 #if NR_IMAGE
             if (!nr_tile_oob((tok0 + uint(m) * 16u) / 16u))
-            NR_STORE_ACC_COL(of, act_e4m3,
+            NR_STORE_ACT_COL(of,
                              pc.o_off + nr_tile_base((tok0 + uint(m) * 16u) / 16u)
                              + uint(n) * 256u, 16u);
 #else
-            NR_STORE_ACC_COL(of, act_e4m3, pc.o_off + wbase
+            NR_STORE_ACT_COL(of, pc.o_off + wbase
                              + (tok0 + uint(m) * 16u) * uint(NR_C) + uint(n) * 16u,
                              uint(NR_C));
 #endif
@@ -2715,7 +2843,7 @@
             NR_ACCF acc = NR_ACCZERO;
             for (int kf = 0; kf < NR_CF; ++kf) {
                 NR_OPA wf;
-                NR_LOAD_A(wf, NR_WARENA, pc.ds_w_off + uint(of * NR_CF + kf) * 256u, 16u);
+                NR_LOAD_WA(wf, pc.ds_w_off + uint(of * NR_CF + kf) * 256u, 16u);
 #if NR_HWAVES
                 NR_FRAG_B dsbk;
                 NR_LOAD_B(dsbk, lds_x, NR_LXB_ uint(kf) * 256u + NR_OPQ(96u), 16u);
@@ -2766,8 +2894,13 @@
                 // The same per-component mode-4 conversion, two at a time
                 // (one v_cvt_pk_fp8_f32 a pair instead of one a value + perms).
                 // Windows: four at a time (nr_quant4_h), the same bytes.
+#if NR_WIN_ST8
+                act_v8[ob / 2u] = uvec2(nr_e4m3x4_bits(nr_quant4_h(f16vec4(outv[0], outv[1], outv[2], outv[3]))),
+                                        nr_e4m3x4_bits(nr_quant4_h(f16vec4(outv[4], outv[5], outv[6], outv[7]))));
+#else
                 act_e4m3x4[ob]      = nr_quant4_h(f16vec4(outv[0], outv[1], outv[2], outv[3]));
                 act_e4m3x4[ob + 1u] = nr_quant4_h(f16vec4(outv[4], outv[5], outv[6], outv[7]));
+#endif
 #else
                 act_e4m3x4[ob]      = fe4m3vec4(nr_quant_e4m3(outv[0]), nr_quant_e4m3(outv[1]),
                                                 nr_quant_e4m3(outv[2]), nr_quant_e4m3(outv[3]));

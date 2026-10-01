@@ -866,9 +866,24 @@ fe4m3vec2 nr_attn_quant(f16vec2 v) {
 #endif
 }
 // Two pairs as one conversion (windows/build/quad_quant_glsl.py), element for element the same.
+// Windows NR_ATTN_QCLAMP: where the f16 clamp happens. LLPC splits an f16 pair clamp into a
+// v_med3_num_f16 per half plus unpack/repack. 1: widen first (the conversion widens anyway) and
+// clamp in f32 - +-448 is exact in f16 and rounding is monotone, so the same bytes. 2: clamp the
+// magnitude bits as integers and put the sign back (same bytes for every non-NaN half).
+#ifndef NR_ATTN_QCLAMP
+#define NR_ATTN_QCLAMP 0
+#endif
 fe4m3vec4 nr_attn_quant4(f16vec2 a, f16vec2 b) {
-#if NR_QUANT_MODE != 4 && !NR_ATTN_SATQ
-    return fe4m3vec4(clamp(f16vec4(a, b), f16vec4(-448.0hf), f16vec4(448.0hf)));
+#if NR_QUANT_MODE != 4 && !NR_ATTN_SATQ && NR_ATTN_QCLAMP == 1
+    return NR_CVT4(clamp(vec4(vec2(a), vec2(b)), vec4(-448.0), vec4(448.0)));
+#elif NR_QUANT_MODE != 4 && !NR_ATTN_SATQ && NR_ATTN_QCLAMP == 2
+    const uvec2 bits = uvec2(packFloat2x16(a), packFloat2x16(b));
+    const uvec2 sgn = bits & 0x80008000u;
+    const u16vec4 mag = min(u16vec4(unpack16(bits.x & 0x7FFF7FFFu), unpack16(bits.y & 0x7FFF7FFFu)),
+                            u16vec4(uint16_t(0x5F00u)));
+    return fe4m3vec4(f16vec4(unpackFloat2x16(pack32(mag.xy) | sgn.x), unpackFloat2x16(pack32(mag.zw) | sgn.y)));
+#elif NR_QUANT_MODE != 4 && !NR_ATTN_SATQ
+    return NR_CVT4(clamp(f16vec4(a, b), f16vec4(-448.0hf), f16vec4(448.0hf)));
 #else
     const fe4m3vec2 p = nr_attn_quant(a), q = nr_attn_quant(b);
     return fe4m3vec4(p.x, p.y, q.x, q.y);

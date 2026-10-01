@@ -33,8 +33,20 @@ spirv_execution_mode(capabilities = [4468], 4463, 16);
 #extension GL_EXT_spirv_intrinsics : require
 spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
 #endif
+#ifndef NR_UPS_SPF
+#define NR_UPS_SPF 0
+#endif
+#if NR_UPS_SPF && (!defined(NR_FUSED_UPS_BLEND) || !NR_UPS_BLEND_PK || NR_HWAVES)
+#error "NR_UPS_SPF: the one-wave packed fused upsample blend"
+#endif
+#ifndef NR_IO_WMMA
+#define NR_IO_WMMA 0
+#endif
 #ifndef NR_IO_DOT2
 #define NR_IO_DOT2 0
+#endif
+#ifndef NR_IO_F32FMA
+#define NR_IO_F32FMA 0   // the post RGB projection as fma() on widened operands (bit-identical)
 #endif
 #if NR_IO_DOT2
 // The RGB output projection's channel pairs as one mixed dot product,
@@ -1332,6 +1344,19 @@ fe4m3vec2 nr_quant_pair_h(f16vec2 v) {
 #ifndef NR_PBATCH
 #define NR_PBATCH 1
 #endif
+// NR_WSHARE=<n> (research): the one-wave C=32 body, n windows a workgroup -
+// one a wave - with the layer's packed weights and position bias read into LDS
+// once by the whole workgroup. Same loads of the same values from LDS instead of
+// the weight buffer; arithmetic unchanged. Host: NR_WSHARE_FSWIN32=<n>.
+#ifndef NR_WSHARE
+#define NR_WSHARE 0
+#endif
+#define NR_WSLOTS (NR_WSHARE > 1 ? NR_WSHARE : 1)
+#if NR_WSHARE > 1 && (NR_PERSIST || NR_HWAVES || NR_C != 32 || NR_PBATCH > 1 || NR_FWAVES != 1 || \
+    !NR_BAKED_EXP_BIAS || NR_UPS_ALIAS || defined(NR_FUSED_IMAGE_INPUT) || defined(NR_FUSED_IMAGE_OUTPUT) || \
+    defined(NR_DS_PROJECT) || NR_ACTIVATION_LUT || NR_CONTEXT_LDS || NR_IMAGE != 1)
+#error "NR_WSHARE: the plain one-wave C=32 layer (fswin32) only"
+#endif
 #if NR_PBATCH > 1
 // NR_PBATCH: one workgroup runs NR_PBATCH persistent items side by side,
 // NR_THREADS invocations each - see the claim below. The idea: the second
@@ -1345,6 +1370,8 @@ fe4m3vec2 nr_quant_pair_h(f16vec2 v) {
 // the second workgroup adds when free-running is gone. C256 0.822..0.837 ms
 // against 0.809..0.831.
 layout(local_size_x = NR_THREADS * NR_PBATCH) in;
+#elif NR_WSHARE > 1
+layout(local_size_x = 32 * NR_WSHARE) in;
 #else
 layout(local_size_x = NR_THREADS) in;
 #endif
@@ -1480,6 +1507,9 @@ layout(set = 0, binding = 0, std430) NR_COH readonly buffer BlendE4M3x4 {
 //
 //   [0] = (history and motion are usable, mv scale x, mv scale y, history strength)
 //   [1] = (history width, history height, depth present, depth inverted)
+#ifndef NR_TEMPORAL_HPASS
+#define NR_TEMPORAL_HPASS 0
+#endif
 layout(set=0,binding=5,std430) readonly buffer NrTemporal { vec4 nr_temporal[3]; };
 #if NR_OUT0_NOFORMAT
 // The answer image's format comes from its view: the runtime hands the post
@@ -1491,10 +1521,19 @@ layout(set=0,binding=6) uniform writeonly image2D nr_out0;
 #else
 layout(set=0,binding=6,rgba32f) uniform writeonly image2D nr_out0;
 #endif
+#ifdef NR_HIST_F16
+// the history images in RGBA16F (the blend's values are f16-exact there).
+layout(set=0,binding=7,rgba16f) uniform writeonly image2D nr_out1;
+#else
 layout(set=0,binding=7,rgba32f) uniform writeonly image2D nr_out1;
+#endif
 layout(set=0,binding=8) uniform sampler2D nr_src;
 layout(set=0,binding=9) uniform sampler2D nr_motion;
 layout(set=0,binding=10) uniform sampler2D nr_history;
+#if NR_TEMPORAL_HPASS
+// the history the pre block reconstructed for this pixel (image_input.glsl).
+layout(set=0,binding=11,rgba32f) uniform readonly image2D nr_hpass;
+#endif
 #include "temporal_history.glsl"
 #else
 #if NR_OUT0_NOFORMAT
@@ -1730,8 +1769,29 @@ layout(push_constant) uniform PushPersist {
 layout(set = 0, binding = 5, std430) coherent buffer Sync { uint nr_sync[]; };
 uint nr_wx, nr_wy;
 #else
+// NR_WPW=<n> (research): the one-wave C=32 layer runs n windows of a row one
+// after the other in one workgroup (the host launches ceil(gx/n) along x) - a
+// launch and its prologue a window fewer.
+#ifndef NR_WPW
+#define NR_WPW 1
+#endif
+#if NR_WPW > 1 && (NR_PERSIST || NR_WSHARE > 1 || NR_PBATCH > 1 || NR_HWAVES || NR_FWAVES != 1 || NR_C != 32 || \
+    defined(NR_FUSED_IMAGE_INPUT) || defined(NR_FUSED_IMAGE_OUTPUT) || defined(NR_FUSED_UPS_PROJECT) || defined(NR_DS_PROJECT))
+#error "NR_WPW: the plain one-wave C=32 layer (fswin32) only"
+#endif
+#if NR_WSHARE > 1 || NR_WPW > 1
+uint nr_wx, nr_wy;
+#elif defined(NR_REV_Y) && NR_REV_Y
+// NR_REV_Y: the plain C=32 layer walks its windows from the last to the first,
+// so a layer that follows a forward one starts on the rows that are still in the
+// memory-side cache (a 4K C=32 half-resolution tensor is ~67 MB, over the 64 MB).
+// Only the order the workgroups take their windows changes.
+#define nr_wx (gl_NumWorkGroups.x - 1u - gl_WorkGroupID.x)
+#define nr_wy (gl_NumWorkGroups.y - 1u - gl_WorkGroupID.y)
+#else
 #define nr_wx (gl_WorkGroupID.x)
 #define nr_wy (gl_WorkGroupID.y)
+#endif
 layout(push_constant) uniform Push {
     uint x_off, o_off, e_off, ct_off, qkv_off, op_off, b_off,
          rs_off, ars_off, s_off, rsd_off, ard_off,
@@ -1794,6 +1854,42 @@ layout(push_constant) uniform Push {
 // the clamps are identities and the out-of-range tests constant false.
 #ifndef NR_PRE_FULL
 #define NR_PRE_FULL 0
+#endif
+#ifndef NR_OOB_NOFLAT
+#define NR_OOB_NOFLAT 0
+#endif
+#ifndef NR_POOL_ST16
+#define NR_POOL_ST16 0
+#endif
+#if NR_POOL_ST16
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+#ifndef NR_CLAIM_LDS
+#define NR_CLAIM_LDS 0
+#endif
+#if NR_CLAIM_LDS
+#if !NR_PERSIST_DF || NR_PBATCH > 1
+#error "NR_CLAIM_LDS: dependency-driven single-item claims"
+#endif
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+#ifndef NR_EXP_NOHI_HEAD
+#define NR_EXP_NOHI_HEAD 0
+#endif
+#if NR_EXP_NOHI_HEAD && !(NR_PERSIST && NR_HWAVES)
+#error "NR_EXP_NOHI_HEAD: persistent head-split bodies (record word 22)"
+#endif
+#if NR_EXP_NOHI_HEAD
+uint nr_hnohi = 0u;
+#endif
+#ifndef NR_DS_ID_NOFLAT
+#define NR_DS_ID_NOFLAT 0
+#endif
+#ifndef NR_LIFT_ACC16
+#define NR_LIFT_ACC16 0
+#endif
+#ifndef NR_LIFT_PRECISE
+#define NR_LIFT_PRECISE 0
 #endif
 #if NR_IMAGE
 uint nr_tile_base(uint q) {
@@ -1973,9 +2069,9 @@ shared NrUpsProj { NR_F16 ups_projected[NR_C * 16]; };
 // NR_STAGE_T is NR_E4M3, or NR_F16 under NR_F16_MMA - twice the bytes, because
 // the operand the logit and context products want is then an f16 fragment. At
 // C=32 that is 4096 B here and 4096 in lds_v, 8192 against 4096.
-shared NR_QK_STAGE_T lds_k[NR_WIN * NR_HD];
+shared NR_QK_STAGE_T lds_k[NR_WIN * NR_HD * NR_WSLOTS];
 #endif
-shared NR_PV_STAGE_T lds_v[NR_HD * NR_WIN];
+shared NR_PV_STAGE_T lds_v[NR_HD * NR_WIN * NR_WSLOTS];
 #endif
 #endif
 #if NR_CONTEXT_LDS
@@ -2006,8 +2102,62 @@ shared NR_STAGE_T lds_context[NR_WIN * NR_C];
 shared uint nr_lds_pad[NR_LDS_PAD / 4];
 #endif
 
+// NR_BIAS_TABLE: the Swin bias as the host's [head][dy+7][qx][kx] table
+// (960 floats a head, 32-byte aligned; nr_graph.cpp checks it reproduces the
+// 64x64 matrix bit for bit). A lane of the [key][query] accumulator holds query
+// tok0 + 16m + lane%16 and keys 16j + 8(lane/16) + 0..7; window tokens are 2x2
+// tiles of 4x4, so the eight keys are two rows of four (ky, ky+1) x (kx..kx+3) -
+// two aligned 16-byte runs of the table (dy and dy-1). Still two loads a
+// fragment, from 3.75 KB a head instead of 16 KB. Same values: byte-identical.
+#ifndef NR_BIAS_TABLE
+#define NR_BIAS_TABLE 0
+#endif
+#if NR_BIAS_TABLE
+#if NR_WIN != 64 || NR_SWIN_BIAS_F16 || NR_F16_MMA
+#error "NR_BIAS_TABLE: 8x8 windows, f32 bias"
+#endif
+layout(set = 0, binding = 3, std430) readonly buffer WgtF32x4 { vec4 wgt_f32x4[]; };
+#define NR_BIAS_TBL_LOAD(frag, hh, q0, kt) { \
+    const uint nr_qt = (q0) / 16u; \
+    const uint nr_qy = 4u * (nr_qt >> 1u) + ((lane & 15u) >> 2u), nr_qx = 4u * (nr_qt & 1u) + (lane & 3u); \
+    const uint nr_ky = 4u * ((kt) >> 1u) + 2u * (lane >> 4u), nr_kx = 4u * ((kt) & 1u); \
+    const uint nr_bi = (pc.b_off + (hh) * 960u + (nr_qy + 7u - nr_ky) * 64u + nr_qx * 8u + nr_kx) / 4u; \
+    const vec4 nr_bv0 = wgt_f32x4[nr_bi], nr_bv1 = wgt_f32x4[nr_bi - 16u]; \
+    for (int c = 0; c < 4; ++c) { frag[c] = nr_bv0[c]; frag[c + 4] = nr_bv1[c]; } }
+#endif
+// diagnostic (wrong picture): NR_DIAG_BFOLD=1 folds every Swin bias fragment
+// read into the first kilobyte of the layer's bias: same loads, tiny footprint.
+#ifndef NR_DIAG_BFOLD
+#define NR_DIAG_BFOLD 0
+#endif
+#if NR_DIAG_BFOLD
+#define NR_BFOLD(x) ((x) & 255u)
+#else
+#define NR_BFOLD(x) x
+#endif
+// diagnostic (wrong picture): NR_DIAG_WFOLD=<records> folds every packed weight read of a
+// layer into its first <records> 512-byte records (power of two): same loads, same data variety,
+// L2/L1 footprint of the weight stream a few KiB. 0 = off.
+#ifndef NR_DIAG_WFOLD
+#define NR_DIAG_WFOLD 0
+#endif
+#define NR_WFOLD(r) ((r) & uint(NR_DIAG_WFOLD - 1))
+#define NR_WFOLD2(r) ((r) & uint(2 * NR_DIAG_WFOLD - 1))
+#if NR_DIAG_WFOLD
+#define NR_WQ1(row,k,kf) NR_WFOLD(((row)/2u)*(kf)+(k))*128u
+#define NR_WQ2(row,k,kf) NR_WFOLD(((row)/2u)*(kf)+(k))*128u
+#else
+#define NR_WQ1(row,k,kf) ((row)/2u)*(kf)*128u+(k)*128u
+#define NR_WQ2(row,k,kf) ((row)/2u)*(kf)*128u + (k)*128u
+#endif
+
+#if NR_DIAG_WFOLD
+#define NR_TILE(base, row, k, kdim) ((base) + NR_WFOLD2(((row) / 16u) * ((kdim) / 16u) \
+                                   + ((k) / 16u)) * 256u)
+#else
 #define NR_TILE(base, row, k, kdim) ((base) + ((row) / 16u) * ((kdim) / 16u) * 256u \
                                    + ((k) / 16u) * 256u)
+#endif
 
 #if NR_PACK_C32_ACTIVE
 #if NR_ACC_F16 != 0 || NR_F16_MMA || NR_WPF
@@ -2015,11 +2165,40 @@ shared uint nr_lds_pad[NR_LDS_PAD / 4];
 #endif
 // Adjacent matrix rows occupy the two halves of one lane's 16-byte record.
 // Keeping row selection constant lets the driver combine adjacent reads.
+#ifndef NR_WSHARE_PARTS
+#define NR_WSHARE_PARTS 3   // 1: weights from LDS, 2: bias from LDS
+#endif
+#if NR_WSHARE > 1 && (NR_WSHARE_PARTS & 1)
+// The four packed C=32 matrices, back to back in LDS (bytes): QKV 3072, the
+// projection 1024, the expansion 4096, the contraction 4096.
+shared fe4m3vec4 nr_wl[3072];
+#define NR_WB_QKV 0u
+#define NR_WB_OP 3072u
+#define NR_WB_E 4096u
+#define NR_WB_CT 8192u
+// A 512-byte record is stored [row parity][lane][2 dwords] instead of the
+// buffer's [lane][4 dwords]: a lane's 8 bytes sit 8 bytes from its neighbour's,
+// so a wave's ds_load_b64 covers all 64 banks once (the buffer order is a
+// 4-way bank conflict in LDS).
 #define NR_C32_WEIGHT(frag,base,row,k,kf) { \
-    const uint q=(base)/4u+((row)/2u)*(kf)*128u+(k)*128u+lane*4u+((row)&1u)*2u; \
-    const fe4m3vec4 lo=wexpand_pair4[q],hi=wexpand_pair4[q+1u]; \
+    const uint q=(base)/4u+NR_WQ1(row,k,kf)+((row)&1u)*64u+lane*2u; \
+    const fe4m3vec4 lo=nr_wl[q],hi=nr_wl[q+1u]; \
     for(int z=0;z<4;++z){(frag)[z]=lo[z];(frag)[z+4]=hi[z];} }
 #else
+#define NR_WB_QKV pc.qkv_off
+#define NR_WB_OP pc.op_off
+#define NR_WB_E pc.e_off
+#define NR_WB_CT pc.ct_off
+#define NR_C32_WEIGHT(frag,base,row,k,kf) { \
+    const uint q=(base)/4u+NR_WQ1(row,k,kf)+lane*4u+((row)&1u)*2u; \
+    const fe4m3vec4 lo=wexpand_pair4[q],hi=wexpand_pair4[q+1u]; \
+    for(int z=0;z<4;++z){(frag)[z]=lo[z];(frag)[z+4]=hi[z];} }
+#endif
+#else
+#define NR_WB_QKV pc.qkv_off
+#define NR_WB_OP pc.op_off
+#define NR_WB_E pc.e_off
+#define NR_WB_CT pc.ct_off
 #define NR_C32_WEIGHT(frag,base,row,k,kf) \
     NR_LOAD_A(frag,NR_WARENA,NR_TILE(base,(row)*16u,(k)*16u,(kf)*16u),16u)
 #endif
@@ -2029,7 +2208,7 @@ shared uint nr_lds_pad[NR_LDS_PAD / 4];
 // reduction. The host repacks only weights, before merging persistent runs.
 #if (defined(NR_PACKED_QKV) || NR_PACKED_DENSE) && NR_HWAVES
 #define NR_WEIGHT_PAIR(wf0,wf1,base,row,k,kfrags) { \
-    const uint q=(base)/4u + ((row)/2u)*(kfrags)*128u + (k)*128u + lane*4u; \
+    const uint q=(base)/4u + NR_WQ2(row,k,kfrags) + lane*4u; \
     const fe4m3vec4 w0=wexpand_pair4[q],w1=wexpand_pair4[q+1u]; \
     const fe4m3vec4 w2=wexpand_pair4[q+2u],w3=wexpand_pair4[q+3u]; \
     for(int v=0;v<4;++v) { \
@@ -2044,6 +2223,15 @@ shared uint nr_lds_pad[NR_LDS_PAD / 4];
 #endif
 #ifndef NR_POOL_PACKED
 #define NR_POOL_PACKED 0
+#endif
+#ifndef NR_DIAG_NOIOPROJ
+#define NR_DIAG_NOIOPROJ 0
+#endif
+#ifndef NR_DIAG_NOBLEND
+#define NR_DIAG_NOBLEND 0
+#endif
+#ifndef NR_DIAG_NOBASE
+#define NR_DIAG_NOBASE 0
 #endif
 #ifndef NR_DIAG_POSTSTORE
 #define NR_DIAG_POSTSTORE 0
@@ -2074,6 +2262,12 @@ shared uint nr_lds_pad[NR_LDS_PAD / 4];
 #endif
 #if NR_POOL_DPP16
 #extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#endif
+#ifndef NR_POST_GAINBC
+#define NR_POST_GAINBC 0   // post reuse path gains loaded once a lane, broadcast
+#endif
+#ifndef NR_POST_REUSE
+#define NR_POST_REUSE 0   // post blend main pixels made once a wave
 #endif
 #ifndef NR_POST_BLEND_PK
 #define NR_POST_BLEND_PK 0
@@ -2362,7 +2556,23 @@ NR_FRAG_ACC nr_swin_bias_seed(uint head, uint query, uint key, uint tok0) {
 #define NR_LXB_
 #endif
 #include "nr_prof.glsl"
+#if NR_WSHARE > 1
+#if NR_WSHARE_PARTS & 2
+shared float nr_bl[NR_WIN * NR_WIN];
+#endif
+// Each wave's own slice of lds_k / lds_v; the body's barriers order one wave's
+// LDS traffic only (a one-wave body never had a workgroup to wait for).
+#define NR_WKB nr_wslot * uint(NR_WIN * NR_HD) +
+#define NR_BODY_BARRIER() subgroupMemoryBarrierShared()
+#else
+#define NR_WKB
+#define NR_BODY_BARRIER() barrier()
+#endif
+#if NR_WPW > 1
+void nr_wpw_window() {
+#else
 void main() {
+#endif
 #if NR_LDS_PAD > 0
     // Same never-taken shape the coherent-access keep-alive uses - but a store
     // alone is not enough: an LDS array that is never *read* is dead and the
@@ -2391,7 +2601,12 @@ void main() {
     // The frame tick: the frame's first C=32 layer (record word 1 set) counts
     // frames for every tile counter behind it - a real barrier follows it, so
     // everything chained later reads this frame's number.
+#if NR_WPW > 1
+    if (2 * int(nr_wx) + pc.shift >= int(pc.tiles_x)) return;
+    if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 1u] != 0u && nr_wx == 0u &&
+#else
     if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 1u] != 0u && gl_WorkGroupID.x == 0u &&
+#endif
         gl_WorkGroupID.y == 0u && gl_LocalInvocationIndex == 0u)
         atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 1u);
 #if defined(NR_FUSED_UPS_PROJECT)
@@ -2412,6 +2627,36 @@ void main() {
     const uint nr_lslot = subgroupBroadcastFirst(gl_LocalInvocationID.x / uint(NR_THREADS));
     const uint nr_lxb = nr_lslot * uint(NR_WIN * NR_C);
     const uint tid = gl_LocalInvocationID.x % uint(NR_THREADS), wave = NR_WAVE_OF(tid), lane = tid % 32u;
+#elif NR_WSHARE > 1
+    const uint nr_wslot = subgroupBroadcastFirst(gl_LocalInvocationID.x / 32u);
+    const uint tid = gl_LocalInvocationID.x % 32u, wave = 0u, lane = tid;
+    // Weights: record dword d = 4*lane + 2*parity + w goes to 64*parity + 2*lane + w.
+#if NR_WSHARE_PARTS & 1
+#define NR_WSH_DST(i) (((i) & ~127u) + (((i) >> 1u) & 1u) * 64u + (((i) >> 2u) & 31u) * 2u + ((i) & 1u))
+    for (uint i = gl_LocalInvocationID.x; i < 768u; i += uint(32 * NR_WSHARE))
+        nr_wl[NR_WSH_DST(i)] = wexpand_pair4[pc.qkv_off / 4u + i];
+    for (uint i = gl_LocalInvocationID.x; i < 256u; i += uint(32 * NR_WSHARE))
+        nr_wl[768u + NR_WSH_DST(i)] = wexpand_pair4[pc.op_off / 4u + i];
+    for (uint i = gl_LocalInvocationID.x; i < 1024u; i += uint(32 * NR_WSHARE)) {
+        nr_wl[1024u + NR_WSH_DST(i)] = wexpand_pair4[pc.e_off / 4u + i];
+        nr_wl[2048u + NR_WSH_DST(i)] = wexpand_pair4[pc.ct_off / 4u + i];
+    }
+#endif
+#if NR_WSHARE_PARTS & 2
+    // Bias: each of the 16 query x key fragments is loaded as the body loads it
+    // and kept in register order, [fragment][component pair][lane][2].
+    for (uint f = nr_wslot; f < 16u; f += uint(NR_WSHARE)) {
+        NR_FRAG_ACC nr_bf;
+        NR_LOAD_ACC_COL(nr_bf, wgt_f32, pc.b_off + (f / 4u) * 16u * uint(NR_WIN) + (f % 4u) * 16u, uint(NR_WIN));
+        for (int c = 0; c < 8; ++c) nr_bl[(f * 4u + uint(c / 2)) * 64u + tid * 2u + uint(c & 1)] = nr_bf[c];
+    }
+#endif
+#if NR_WSHARE_PARTS
+    barrier();
+#endif
+    nr_wx = gl_WorkGroupID.x * uint(NR_WSHARE) + nr_wslot;
+    nr_wy = gl_WorkGroupID.y;
+    if (2 * int(nr_wx) + pc.shift >= int(pc.tiles_x)) return;
 #else
     const uint tid = gl_LocalInvocationID.x, wave = NR_WAVE_OF(tid), lane = tid % 32u;
 #endif
@@ -2704,7 +2949,14 @@ void main() {
                 } else it |= it << 16u;
             }
 #endif
+#if NR_CLAIM_LDS
+            // the claim reaches the other waves through LDS (every array is
+            // free between items), not an L2 slot written and read back.
+            { const fe4m3vec4 nr_cb = uintBitsToFloate4m3EXT(unpack8(it));
+              lds_x[0] = nr_cb.x; lds_x[1] = nr_cb.y; lds_x[2] = nr_cb.z; lds_x[3] = nr_cb.w; }
+#else
             atomicExchange(nr_sync[nr_slot], it);
+#endif
         }
 #else
         if (tid == 0u)
@@ -2715,10 +2967,15 @@ void main() {
         // write has to be retired before it: without this, another wave's read
         // of the slot can overtake thread 0's store and the workgroup splits
         // across two items.
+#if NR_CLAIM_LDS
+        barrier();
+        const uint nr_claim = pack32(floate4m3BitsToUintEXT(fe4m3vec4(lds_x[0], lds_x[1], lds_x[2], lds_x[3])));
+#else
         memoryBarrierBuffer();
         barrier();
         uint nr_claim = 0u;
         if (subgroupElect()) nr_claim = atomicAdd(nr_sync[nr_slot], 0u);
+#endif
 #if NR_PBATCH > 1
         const uint nr_pair = subgroupBroadcastFirst(nr_claim);
         barrier();                  // nobody writes the slot again until here
@@ -2751,6 +3008,9 @@ void main() {
         pc.pool_off = wgt_u32[pb + 17u];
         pc.pool_tiles_x = wgt_u32[pb + 18u]; pc.pool_tiles_y = wgt_u32[pb + 19u];
         const uint nr_gx = wgt_u32[pb + 20u];
+#if NR_EXP_NOHI_HEAD
+        nr_hnohi = wgt_u32[pb + 22u];
+#endif
         const uint nr_flag = pcp.sync_off + 4u + wgt_u32[pb + 23u];
         const uint nr_w = nr_item - wgt_u32[pb + 23u];
         nr_wx = nr_w % nr_gx;
@@ -3032,6 +3292,21 @@ void main() {
     // one token it owns per fragment pair. `tok0 + 2p*16 + lane` is the low
     // half's even fragment and the high half's odd one at the same time, so the
     // pair covers 32 tokens a wave and the wave count covers all 64.
+#if NR_IO_WMMA
+    // Row r of the projection at lane l < 16 is token l of the fragment; the high
+    // half-wave takes the odd fragment's token l-16 from lane l^16.
+    for (int p = 0; p < NR_MF / 2; ++p) {
+        const vec3 nr_ev = vec3(nr_io_rgb[2 * p][0], nr_io_rgb[2 * p][1], nr_io_rgb[2 * p][2]);
+        const vec3 nr_od = vec3(subgroupShuffleXor(nr_io_rgb[2 * p + 1][0], 16u),
+                                subgroupShuffleXor(nr_io_rgb[2 * p + 1][1], 16u),
+                                subgroupShuffleXor(nr_io_rgb[2 * p + 1][2], 16u));
+        nr_io_o[p] = nr_io_lo ? nr_ev : nr_od;
+#ifdef NR_TEMPORAL_HISTORY
+        const float nr_ow1 = subgroupShuffleXor(nr_io_rgb[2 * p + 1][3], 16u);
+        nr_io_ow[p] = nr_io_lo ? nr_io_rgb[2 * p][3] : nr_ow1;
+#endif
+    }
+#endif
     for(int nr_io_p=0;nr_io_p<NR_MF/2;++nr_io_p) {
     const uint token=tok0+uint(nr_io_p)*32u+lane;
     const vec3 o=nr_io_o[nr_io_p];
@@ -3095,7 +3370,11 @@ void main() {
 #if NR_POST_ALPHA
     // One fetch for the base colour and, when the alpha is restored, its alpha:
     // uv is the texel centre, so this is the texel texelFetch would return.
+#if NR_DIAG_NOBASE
+    const vec4 nr_base4=vec4(uv.x,uv.y,0.5,1.0);   // diagnostic (wrong picture): no base colour fetch
+#else
     const vec4 nr_base4=textureLod(nr_src,uv,0.0);
+#endif
     const vec3 base=nr_base4.rgb;
 #else
     const vec3 base=textureLod(nr_src,uv,0.0).rgb;
@@ -3107,13 +3386,20 @@ void main() {
     // arithmetic, which is what lets the first frame stay byte-identical.
     float w=0.0;
     if(nr_temporal[0].x!=0.0) {
+#if NR_TEMPORAL_HPASS
+        const vec3 hist=imageLoad(nr_hpass,pixel).rgb;
+#else
         const vec2 mv=textureLod(nr_motion,uv*nr_temporal[2].xy+nr_temporal[2].zw,0.0).xy*nr_temporal[0].yz;
         const vec2 extent=nr_temporal[1].xy;
         const vec3 hist=nr_history_5tap(nr_history,(uv+mv)*extent,vec2(0.5),
                                         extent-0.5,1.0/extent);
+#endif
         // ex2(x * -log2 e) then rcp(1 + that): the original's sigmoid, verbatim.
         w=clamp(1.0/(1.0+exp(-ow))*clamp(nr_temporal[0].w,0.0,1.0),0.0,1.0);
         rgb=mix(rgb,hist,w);
+#ifdef NR_DIAG_HISTOUT
+        rgb=hist;   // diagnostic: the post's history reconstruction as the answer
+#endif
     }
     // The network's own image - the blended one the original stores - before
     // the application strength. This distinction is read out of the original's
@@ -3240,3 +3526,13 @@ void main() {
 #endif
 #endif
 }
+#if NR_WPW > 1
+void main() {
+    nr_wy = gl_WorkGroupID.y;
+    [[dont_unroll]] for (uint nr_k = 0u; nr_k < uint(NR_WPW); ++nr_k) {
+        nr_wx = gl_WorkGroupID.x * uint(NR_WPW) + nr_k;
+        nr_wpw_window();
+        barrier();
+    }
+}
+#endif

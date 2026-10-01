@@ -51,6 +51,27 @@
 #ifndef NR_GEMM_WIDE_NT
 #define NR_GEMM_WIDE_NT 256
 #endif
+// the ViT QKV at small extents (gemmvqkvnorms, 2x6 fragments a wave):
+// at 1080p its 640 tokens made 480 waves of the 4x4 tile, 3.75 a SIMD; the 2x6
+// tile makes 640 (5 a SIMD) at 144 VGPRs. 1440p and 4K keep gemmvqkvnorm.
+#ifndef NR_GEMM_QKVS_MT
+#define NR_GEMM_QKVS_MT 32
+#endif
+#ifndef NR_GEMM_QKVS_NT
+#define NR_GEMM_QKVS_NT 384
+#endif
+#ifndef NR_GEMM_QKVS_WN
+#define NR_GEMM_QKVS_WN 4
+#endif
+#ifndef NR_VIT_HPAIR
+#define NR_VIT_HPAIR 0   // SPVs built with gemmvact NR_OUT_KPAIR + gemmprojw NR_A_KPAIR
+#endif
+#ifndef NR_VIT_CT41
+#define NR_VIT_CT41 0    // the ViT contraction on gemmprojh built 4x1 fragments (MT 64, NT 64), unpacked weights
+#endif
+#ifndef NR_QKVS_MAX_TOKENS
+#define NR_QKVS_MAX_TOKENS 768
+#endif
 // ffwd3 subgroups per workgroup (one group each); the grid scales by 8/this.
 #ifndef NR_FFWD_WGW
 #define NR_FFWD_WGW 8
@@ -147,6 +168,12 @@ static std::vector<uint8_t> g_tc_nobar;
 static std::vector<uint32_t> g_tc_words;
 static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
 static size_t g_tc_base = 0;
+static uint32_t g_post_out_h = 0;   // dead rows: the picture's height at the fused post block
+static std::vector<float> g_audit_bias;   // clamp audit
+// NR_EXP_NOHI: C=32 steps whose weights keep every Swin exponent input under
+// the upper clamp (see the audit where the head scales are packed).
+static std::set<std::pair<int, int>> g_nohi;
+static std::map<std::pair<int, int>, uint32_t> g_nohi_heads;   // bit h = head h clamp-free
 static bool tchain_active() {
     const char* e = std::getenv("NR_TCHAIN");
     return NR_TCHAIN_TILES && !(e && *e && std::atoi(e) == 0) && g_chain_epoch_word != 0xFFFFFFFFu;
@@ -158,14 +185,17 @@ static bool tchain_active() {
 // exists, so this looks only at the kernels; the build checks the data offsets.
 static bool tchain_pair(const std::string& p, const std::string& q) {
     auto g = [](const std::string& k) { return k == "gemmprojc"; };
-    auto f = [](const std::string& k) { return k == "ffwd3" || k == "ffwd3w"; };
-    auto vp = [](const std::string& k) { return k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt"; };
+    auto f = [](const std::string& k) { return k == "ffwd3" || k == "ffwd3w" || k == "ffwd3q"; };
+    auto vp = [](const std::string& k) { return k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt" || k == "gemmprojh"; };
     auto up = [](const std::string& k) { return k == "fswinpup256" || k == "fswinpup128" || k == "fswinpup64"; };
     static const uint32_t kinds = std::getenv("NR_TCHAIN_KINDS")   // diagnostic: bit per group below
-        ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_KINDS"), nullptr, 0)) : 0xFFu;
+        ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_KINDS"), nullptr, 0)) : 0x1FFu;
     return ((kinds & 1) && ((p == "attn" && g(q)) || (g(p) && f(q)) || (f(p) && g(q)) || (g(p) && q == "attn"))) ||
-           ((kinds & 2) && p == "gemmvact" && vp(q)) || ((kinds & 4) && vp(p) && q == "gemmvqkvnorm") ||
-           ((kinds & 8) && p == "vitattn" && vp(q)) || ((kinds & 16) && vp(p) && q == "gemmvact") ||
+           ((kinds & 2) && (p == "gemmvact" || p == "gemmvacts") && vp(q)) || ((kinds & 4) && vp(p) && (q == "gemmvqkvnorm" || q == "gemmvqkvnorms")) ||
+           ((kinds & 8) && p == "vitattn" && vp(q)) ||
+           // (research NR_TC_QKVATTN=1, vitattn built NR_TC_ALLWAIT=1): QKV -> attention, all tiles
+           ((kinds & 256) && std::getenv("NR_TC_QKVATTN") && std::atoi(std::getenv("NR_TC_QKVATTN")) &&
+            (p == "gemmvqkvnorm" || p == "gemmvqkvnorms") && q == "vitattn") || ((kinds & 16) && vp(p) && (q == "gemmvact" || q == "gemmvacts")) ||
            // the decoder: C=512 -> the UPS-first C=256 run -> C=128 -> C=64 -> the C=32 fused upsample
            ((kinds & 32) && ((g(p) && up(q)) || (up(p) && (up(q) || q == "fswinfusedup32")))) ||
            // the encoder: each level's downsample -> the next level's DS-last run
@@ -177,9 +207,12 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // The kernels built with NR_TCHAIN=1, which carry the five push words right
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
-static bool tchain_kern(const std::string& k) {
-    return k == "attn" || k == "gemmprojc" || k == "ffwd3" || k == "ffwd3w" || k == "gemmvact" ||
-           k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt" || k == "gemmvqkvnorm" || k == "vitattn" ||
+static bool tchain_kern(const std::string& k00) {
+    // "rv" = the same kernel walking its windows backwards (NR_REV_Y).
+    const std::string k0 = k00.size() > 2 && k00.compare(k00.size() - 2, 2, "rv") == 0 ? k00.substr(0, k00.size() - 2) : k00;
+    const std::string k = k0.size() > 2 && k0.compare(k0.size() - 2, 2, "nh") == 0 ? k0.substr(0, k0.size() - 2) : k0;
+    return k == "attn" || k == "gemmprojc" || k == "ffwd3" || k == "ffwd3w" || k == "ffwd3q" || k == "gemmvact" || k == "gemmvacts" ||
+           k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt" || k == "gemmprojh" || k == "gemmvqkvnorm" || k == "gemmvqkvnorms" || k == "vitattn" ||
            k == "fswinpup256" || k == "fswinpup128" || k == "fswinpup64" || k == "fswinfusedup32" ||
            k == "fswinpds256" || k == "fswinpds128" || k == "fswinpds64" || k == "fswindsp32" || k == "fswin32";
 }
@@ -224,6 +257,17 @@ static bool tchain_kern(const std::string& k) {
 #endif
 #ifndef NR_GEMM_PROJW_NT
 #define NR_GEMM_PROJW_NT 128
+#endif
+#ifndef NR_FFWD_FM4_MIN_TOKENS
+#define NR_FFWD_FM4_MIN_TOKENS 0
+#endif
+#ifndef NR_ATTN_WPAIR_HOST
+#define NR_ATTN_WPAIR_HOST 1
+#endif
+// NR_PROJW_PROJ: the ViT output projections join the contraction on the
+// 64x128 gemmprojw tile from NR_PROJW_MIN_TOKENS on (4K: -14 us, 12 ABAB runs).
+#ifndef NR_PROJW_PROJ
+#define NR_PROJW_PROJ 1
 #endif
 #ifndef NR_PROJW_MIN_TOKENS
 #define NR_PROJW_MIN_TOKENS 2048
@@ -944,6 +988,11 @@ struct Disp {
     // The lowered steps this dispatch executes, as positions in `run`: one step,
     // or the whole range of a merged persistent run. What arena reuse reads.
     int lo = -1, hi = -1;
+    // NR_VIT_SPLIT: the dispatch this one waits on through tile counters when
+    // it is not the preceding one (-2: none, a real barrier precedes it), the
+    // producer tile of this dispatch's local tile 0, and whether the barrier
+    // after this dispatch stays.
+    int tc_prod = -1; uint32_t tc_off = 0; int split = 0;
 };
 
 // The activation arena's slot table, and which lowered steps ask for each slot.
@@ -1169,6 +1218,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         std::fprintf(stderr, "--host-boundary and --legacy-boundary conflict\n"); return 1;
     }
     g_host_shapes = host_boundary;
+    g_post_out_h = 0; g_nohi.clear(); g_nohi_heads.clear(); g_audit_bias.clear();   // per graph build
     plan = prepared_plan ? *prepared_plan : load_plan(plan_path);
     std::printf("%zu steps from %s\n", plan.size(), plan_path.c_str());
 
@@ -1724,10 +1774,44 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 // Changes rounding: a*(logit+bias)+b -> fma(a,logit,fma(a,bias,b)).
                 if (math_profile == 2 || math_profile == 3)
                     for (float& v : bias) v = std::fma(v, 0.044921875f, 1.30078125f);
+                g_audit_bias = bias;
                 // Recovered position bias is already FP16. Widen only when
                 // adding it to FP32 logits; no new numerical rounding.
                 p.b_off = swin_bias_f16 ? uint32_t(put_f16(bias) / 2)
                                        : uint32_t(put_f32(bias) / 4);
+                // NR_BIAS_TABLE (research, SPVs built with it): the 64x64 bias of a
+                // head depends on (qy - ky, qx, kx) only, so it is stored as that table,
+                // [dy+7][qx][kx], 960 floats a head (a fragment lane's eight keys are one
+                // 32-byte run). Checked element by element; any mismatch keeps the matrix.
+                static const bool bias_table = std::getenv("NR_BIAS_TABLE") && std::atoi(std::getenv("NR_BIAS_TABLE"));
+                if (bias_table && !swin_bias_f16) {
+                    std::vector<float> tbl(size_t(heads) * 960, 0.0f);
+                    std::vector<uint8_t> seen(tbl.size(), 0);
+                    bool ok = true;
+                    for (int h = 0; h < heads && ok; ++h)
+                        for (int q = 0; q < 64 && ok; ++q) for (int k = 0; k < 64; ++k) {
+                            // window tokens are 2x2 tiles of 4x4: t = tile*16 + iy*4 + ix
+                            const int qy = 4 * ((q / 16) / 2) + (q % 16) / 4, qx = 4 * ((q / 16) % 2) + q % 4;
+                            const int ky = 4 * ((k / 16) / 2) + (k % 16) / 4, kx = 4 * ((k / 16) % 2) + k % 4;
+                            const int dy = qy - ky;
+                            const size_t t = size_t(h) * 960 + size_t((dy + 7) * 64 + qx * 8 + kx);
+                            const float v = bias[size_t(h) * 4096 + size_t(q) * 64 + size_t(k)];
+                            if (!seen[t]) { tbl[t] = v; seen[t] = 1; }
+                            else if (std::memcmp(&tbl[t], &v, 4) != 0) {
+                                if (std::getenv("NR_BIAS_TABLE_DEBUG")) {
+                                    std::fprintf(stderr, "bias table mismatch b%dl%d h%d q%d k%d: %g vs %g\n", s.block, s.layer, h, q, k, double(tbl[t]), double(v));
+                                    // hypothesis dump: row q, keys 0..15
+                                    for (int qq : {0, 8, 9, 27}) { std::fprintf(stderr, "q%2d:", qq);
+                                        for (int kk = 0; kk < 16; ++kk) std::fprintf(stderr, " %.4f", double(bias[size_t(h) * 4096 + size_t(qq) * 64 + size_t(kk)]));
+                                        std::fprintf(stderr, "\n"); }
+                                }
+                                ok = false; break; }
+                        }
+                    if (!ok) throw std::runtime_error("NR_BIAS_TABLE: bias is not a (dy, qx, kx) table");
+                    std::vector<uint8_t> b(tbl.size() * 4);
+                    std::memcpy(b.data(), tbl.data(), b.size());
+                    p.b_off = uint32_t(put(b, 32) / 4);
+                }
             }
             {
                 const std::vector<float> r = load_f16(std::string(base) + ".residual_scale.bin");
@@ -1756,6 +1840,67 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 p.rs_off = residual_half ? uint32_t(put_f16(rs)/2) : uint32_t(put_f32(rs)/4);
                 p.ars_off = residual_half ? uint32_t(put_f16(ars)/2) : uint32_t(put_f32(ars)/4);
                 p.s_off = uint32_t(put_f32(sc) / 4);
+                if (g_audit_bias.size() == size_t(heads) * 4096 && sc.size() >= size_t(heads)) {
+                    // |logit| <= |q^|.|k^| <= 1.139|s| + 0.006 (unit-normalised q, k; e4m3 rounding
+                    // at most 1/16 relative plus half a subnormal step; f16 norm within 2^-9).
+                    // Margin: 1.2|s| + 0.05. Upper clamp dead <=> every baked bias + a*bound <= hi.
+                    bool dead = true;
+                    for (int h = 0; h < heads && dead; ++h) {
+                        const double sa = 0.044921875 * (1.2 * std::fabs(double(sc[size_t(h)])) + 0.05);
+                        for (int i = 0; i < 4096 && dead; ++i)
+                            if (!(double(g_audit_bias[size_t(h) * 4096 + size_t(i)]) + sa <= 1.5693359375)) dead = false;
+                    }
+                    if (dead && C == 32) g_nohi.insert({s.block, s.layer});
+                    uint32_t hm = 0;
+                    for (int h = 0; h < heads && h < 32; ++h) {
+                        const double sa = 0.044921875 * (1.2 * std::fabs(double(sc[size_t(h)])) + 0.05);
+                        bool hd = true;
+                        for (int i = 0; i < 4096 && hd; ++i)
+                            if (!(double(g_audit_bias[size_t(h) * 4096 + size_t(i)]) + sa <= 1.5693359375)) hd = false;
+                        if (hd) hm |= 1u << h;
+                    }
+                    g_nohi_heads[{s.block, s.layer}] = hm;
+                }
+                if (std::getenv("NR_TILE_AUDIT") && g_audit_bias.size() == size_t(heads) * 4096 && sc.size() >= size_t(heads)) {
+                    // 16x16 (query tile, key tile) blocks whose every baked bias
+                    // stays at or below the lower exponent clamp for any certified logit - their exponential
+                    // is a constant. Also the per-block slack to the nearest case.
+                    int nconst = 0, ntot = 0; double best = 1e30;
+                    for (int h = 0; h < heads; ++h) {
+                        const double sa = 0.044921875 * (1.2 * std::fabs(double(sc[size_t(h)])) + 0.05);
+                        for (int qt = 0; qt < 4; ++qt) for (int kt = 0; kt < 4; ++kt) {
+                            double mx = -1e30;
+                            for (int qi = 0; qi < 16; ++qi) for (int ki = 0; ki < 16; ++ki)
+                                mx = std::max(mx, double(g_audit_bias[size_t(h) * 4096 + size_t(qt * 16 + qi) * 64 + size_t(kt * 16 + ki)]));
+                            ++ntot; if (mx + sa <= 1.03125) ++nconst;
+                            best = std::min(best, mx + sa - 1.03125);
+                        }
+                    }
+                    std::printf("tile audit b%dl%d C=%d heads %d: constant-low blocks %d of %d, closest block misses by %.5f\n",
+                                s.block, s.layer, C, heads, nconst, ntot, best);
+                }
+                if (std::getenv("NR_CLAMP_AUDIT") && g_audit_bias.size() == size_t(heads) * 4096) {
+                    // audit: |logit| <= 1.2*|scale| (unit q, k after e4m3 rounding, Cauchy-Schwarz with margin);
+                    // the exp clamp [1.03125, 1.5693359375] is dead when every baked bias +- a*1.2|s| stays inside.
+                    double hi = -1e30, lo = 1e30, smax = 0;
+                    for (int h = 0; h < heads; ++h) {
+                        const double sa = 0.044921875 * 1.2 * std::fabs(double(h < int(sc.size()) ? sc[size_t(h)] : 1e9));
+                        smax = std::max(smax, std::fabs(double(sc[size_t(h)])));
+                        for (int i = 0; i < 4096; ++i) {
+                            const double b = g_audit_bias[size_t(h) * 4096 + size_t(i)];
+                            hi = std::max(hi, b + sa); lo = std::min(lo, b - sa);
+                        }
+                    }
+                    std::printf("clamp audit b%dl%d C=%d heads %d: |s|max %.3f  y range [%.5f, %.5f]  dead %d  heads:", s.block, s.layer, C, heads,
+                                smax, lo, hi, int(lo >= 1.03125 && hi <= 1.5693359375));
+                    for (int h = 0; h < heads; ++h) {
+                        const double sa = 0.044921875 * (1.2 * std::fabs(double(sc[size_t(h)])) + 0.05);
+                        double hh = -1e30;
+                        for (int i = 0; i < 4096; ++i) hh = std::max(hh, double(g_audit_bias[size_t(h) * 4096 + size_t(i)]) + sa);
+                        std::printf(" %d", int(hh <= 1.5693359375));
+                    }
+                    std::printf("\n");
+                }
                 auto diag = [&](const std::vector<float>& v) {
                     std::vector<uint8_t> t(size_t(C / 16) * 256 * 2, 0);
                     for (int n = 0; n < C; ++n) {
@@ -2154,6 +2299,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     // projection/strength math. Nondefault diagnostic projection
                     // controls retain the separate output pipeline.
                     Disp& post=disp.back();post.kern="fswinimagepost32";
+                    g_post_out_h=po.H;
                     const PushImageTail tail{po.w_off,po.nr_intensity};
                     const size_t offset=sizeof(PushFSwin)+sizeof(PushUps);
                     post.push.resize(offset+sizeof tail);
@@ -2759,16 +2905,22 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 : tiles_of(s.H) * tiles_of(s.W) * 16u;
             p.M = vt; p.C = 512u;
             const bool fm2 = NR_FFWD_FM2_MIN_TOKENS != 0 && vt >= uint32_t(NR_FFWD_FM2_MIN_TOKENS);
-            d.kern = fm2 ? "ffwd3w" : "ffwd3";
+            // ffwd3q (NR_FFWD_FM=4: four token tiles a subgroup) from NR_FFWD_FM4_MIN_TOKENS.
+            static const uint32_t fm4_min = std::getenv("NR_FFWD_FM4") ? uint32_t(std::atoi(std::getenv("NR_FFWD_FM4")))
+                                                                      : uint32_t(NR_FFWD_FM4_MIN_TOKENS);
+            const bool fm4 = fm4_min != 0 && vt >= fm4_min;
+            static const uint32_t q_tpw = std::getenv("NR_FFWD_TPW") ? uint32_t(std::atoi(std::getenv("NR_FFWD_TPW"))) : 4u;
+            const uint32_t tpu = fm4 ? q_tpw : fm2 ? 2u : 1u;   // token tiles a subgroup
+            d.kern = fm4 ? "ffwd3q" : fm2 ? "ffwd3w" : "ffwd3";
 #if NR_FFWD_GMAJOR
             // Group-major workgroups (ffwd3_t.comp NR_FFWD_GMAJOR): eight groups
             // times the token units split NR_FFWD_WGW a workgroup, the last one partial.
             {
-                const uint32_t units = (vt / 16u + (fm2 ? 1u : 0u)) / (fm2 ? 2u : 1u);
+                const uint32_t units = (vt / 16u + tpu - 1u) / tpu;
                 d.gx = 8u * ((units + uint32_t(NR_FFWD_WGW) - 1u) / uint32_t(NR_FFWD_WGW));
             }
 #else
-            d.gx = (vt / 16u + (fm2 ? 1u : 0u)) / (fm2 ? 2u : 1u) * (8u / uint32_t(NR_FFWD_WGW));
+            d.gx = (vt / 16u + tpu - 1u) / tpu * (8u / uint32_t(NR_FFWD_WGW));
 #endif
             d.gy = 1; d.gz = 1;
             d.push.resize(sizeof p);
@@ -2793,6 +2945,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     std::copy(dz.begin(), dz.end(), bias.begin() + size_t(h) * 4096);
                 }
                 p.b_off = uint32_t(put_f32(bias) / 4);
+                g_audit_bias = bias;
             }
             {
                 const std::vector<uint8_t> tail = slurp(std::string(base) + ".tail.bin");
@@ -2800,6 +2953,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 for (size_t h = 0; h < 16 && 4 * h + 4 <= tail.size(); ++h)
                     std::memcpy(&sc[h], &tail[4 * h], 4);
                 p.s_off = uint32_t(put_f32(sc) / 4);
+                if (std::getenv("NR_CLAMP_AUDIT") && g_audit_bias.size() == 16u * 4096u) {
+                    double hi = -1e30, lo = 1e30, smax = 0;
+                    for (int h = 0; h < 16; ++h) {
+                        const double sa = 1.2 * std::fabs(double(sc[size_t(h)])) + 0.05;
+                        smax = std::max(smax, std::fabs(double(sc[size_t(h)])));
+                        for (int i = 0; i < 4096; ++i) {
+                            const double b = g_audit_bias[size_t(h) * 4096 + size_t(i)];
+                            hi = std::max(hi, b + sa); lo = std::min(lo, b - sa);
+                        }
+                    }
+                    std::printf("clamp audit attn b%dl%d: |s|max %.3f  x range [%.3f, %.3f] (clamp at [-6.0, 5.98])\n", s.block, s.layer, smax, lo, hi);
+                }
             }
             p.x_off = uint32_t(voff[x_src(s)]);
             p.o_off = uint32_t(voff[key_of(s.block, s.layer)]);
@@ -2965,12 +3130,26 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const bool wide = sh.wide && !compact_proj;
             const bool proj_tile = !wide && resid && !sh.act &&
                                    !(host_boundary && s.type == "CCSplitSwin16HProjPool");
-            const bool projw = proj_tile && s.type == "CCVit1DFfnContract" &&
-                               M >= size_t(NR_PROJW_MIN_TOKENS) && !flag(argc, argv, "--no-projw");
-            const uint32_t mt = wide ? uint32_t(NR_GEMM_WIDE_MT) :
+            // diagnostic: NR_DIAG_PROJW=<bits> sends the ViT contraction (1) and
+            // projection (2) to gemmprojw at every extent.
+            static const uint32_t diag_projw = std::getenv("NR_DIAG_PROJW") ? uint32_t(std::atoi(std::getenv("NR_DIAG_PROJW"))) : 0u;
+            const bool projw = proj_tile && !flag(argc, argv, "--no-projw") &&
+                               ((s.type == "CCVit1DFfnContract" && (M >= size_t(NR_PROJW_MIN_TOKENS) || (diag_projw & 1u))) ||
+                                (s.type == "CCVit1DProjection" && ((diag_projw & 2u) || (NR_PROJW_PROJ && M >= size_t(NR_PROJW_MIN_TOKENS))) &&
+                                 !(s.block == 38 && s.layer == 4)));
+            const bool qkvt = wide && s.type == "CCVit1DQKV" && qkv_fused_norm &&
+                              M <= size_t(NR_QKVS_MAX_TOKENS) && !flag(argc, argv, "--no-qkvs");
+            const bool ct41 = NR_VIT_CT41 && s.type == "CCVit1DFfnContract" && proj_tile && !projw;
+            // (research NR_VACTS=1): the ViT expansion at small extents on a 32-token M
+            // tile (gemmvacts, 2x4 fragments a wave): 1080p's 640 tokens make 320 workgroups,
+            // 10 waves a SIMD, instead of 160 (5).
+            static const bool vacts_env = std::getenv("NR_VACTS") && std::atoi(std::getenv("NR_VACTS"));
+            const bool vacts = vacts_env && wide && sh.act && M <= size_t(NR_QKVS_MAX_TOKENS) &&
+                               std::filesystem::exists(spv_dir + "/g_gemmvacts.spv");
+            const uint32_t mt = ct41 ? 64u : qkvt ? uint32_t(NR_GEMM_QKVS_MT) : vacts ? 32u : wide ? uint32_t(NR_GEMM_WIDE_MT) :
                                 projw ? uint32_t(NR_GEMM_PROJW_MT) :
                                 proj_tile ? uint32_t(NR_GEMM_PROJ_MT) : 64u,
-                           nt = wide ? uint32_t(NR_GEMM_WIDE_NT) :
+                           nt = ct41 ? 64u : qkvt ? uint32_t(NR_GEMM_QKVS_NT) : wide ? uint32_t(NR_GEMM_WIDE_NT) :
                                 projw ? uint32_t(NR_GEMM_PROJW_NT) :
                                 proj_tile ? uint32_t(NR_GEMM_PROJ_NT) : 128u;
             if (N % nt) {
@@ -2986,6 +3165,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // (NR_SWAP_AB). Neither pays on the ViT shapes that share gemmproj.
             // 1080p -8 us, 1440p -24, 4K -35 over the 31 dispatches.
             if (d.kern == "gemmproj" && s.type.rfind("CCSplitSwin16H", 0) == 0) d.kern = "gemmprojc";
+            if (vacts) d.kern = "gemmvacts";
+#if NR_VIT_HPAIR || NR_VIT_CT41
+            // the ViT FFN hidden is stored K-pair interleaved by gemmvact
+            // (NR_OUT_KPAIR); the contraction reads it as such (NR_A_KPAIR).
+            if (d.kern == "gemmproj" && s.type == "CCVit1DFfnContract") d.kern = "gemmprojh";
+#endif
             if (host_boundary && s.type == "CCSplitSwin16HProjPool") {
                 d.kern = "gemmpool";
                 p.p_off = uint32_t(voff[pool_key(s.block)]);
@@ -3004,6 +3189,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                  (s.type == "CCVit1DProjection" && M < size_t(NR_PROJW_MIN_TOKENS)) ||
                  (s.type == "CCVit1DFfnExpand" && M <= 1024)))
                 p.remap = 2;
+            // diagnostic: NR_REMAP_VIT=<G> overrides the ViT GEMMs' workgroup order (0 = launch order)
+            if (const char* e = std::getenv("NR_REMAP_VIT"))
+                if (s.type.rfind("CCVit1D", 0) == 0 && s.type != "CCVit1DQKV") p.remap = uint32_t(std::atoi(e));
 #endif
             d.push.resize(sizeof p);
             std::memcpy(d.push.data(), &p, sizeof p);
@@ -3025,7 +3213,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             if(qkv_fused_norm) {
                 if(p.N != 3072 || p.K != 1024) throw std::runtime_error("QKV fusion: unexpected QKV shape");
                 p.o_off=pn.dst; p.r_off=pn.scale_off;
-                d.kern="gemmvqkvnorm";
+                d.kern=(p.M<=uint32_t(NR_QKVS_MAX_TOKENS) && !flag(argc,argv,"--no-qkvs")) ? "gemmvqkvnorms" : "gemmvqkvnorm";
                 std::memcpy(d.push.data(),&p,sizeof p);
                 disp.push_back(std::move(d));
                 continue;
@@ -3094,8 +3282,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         };
         // Layout 2 extends layout 1 with the three grouped FFWD matrices.
         const bool pack_ffwd = weight_layout >= 2;
+        std::set<uint32_t> packed_attn;   // an attention matrix is packed once even if two dispatches share it
         for(const auto& pd:disp) {
-            if(pack_ffwd && (pd.kern=="ffwd3" || pd.kern=="ffwd3w")) {
+            if(pack_ffwd && (pd.kern=="ffwd3" || pd.kern=="ffwd3w" || pd.kern=="ffwd3q")) {
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
@@ -3104,7 +3293,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J);
                 continue;
             }
-            if(pd.kern=="gemmproj" || pd.kern=="gemmprojc" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm") {
+            // NR_ATTN_WPAIR (research): the C=512 attention's QKV matrix [1536][512] in the same pair layout.
+            // on by default (pipelines.json builds attn with NR_ATTN_WPAIR=1); env 0 turns it off.
+            if(pd.kern=="attn" && (std::getenv("NR_ATTN_WPAIR") ? std::atoi(std::getenv("NR_ATTN_WPAIR")) != 0 : NR_ATTN_WPAIR_HOST != 0)) {
+                PushAttn p{};
+                if(pd.push.size()<sizeof p) throw std::runtime_error("packed attn push mismatch");
+                std::memcpy(&p,pd.push.data(),sizeof p);
+                if(!packed_attn.count(p.w_off)) { pack_matrix(p.w_off,1536,512); packed_attn.insert(p.w_off); }
+                continue;
+            }
+            if(pd.kern=="gemmproj" || (pd.kern=="gemmprojh" && !NR_VIT_CT41) || pd.kern=="gemmprojc" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvacts" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm" || pd.kern=="gemmvqkvnorms") {
                 PushGemm p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed GEMM push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
@@ -3274,6 +3472,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 }
                 std::vector<uint8_t> recs(size_t(n) * sizeof(PersistRec));
                 std::memcpy(recs.data(), rec.data(), recs.size());
+                // NR_EXP_NOHI_HEAD: word 22 (the window count, host-only) carries the
+                // layer's clamp-free head mask for the shader. NR_EXP_NOHI=0: none.
+                if (!(std::getenv("NR_EXP_NOHI") && !std::atoi(std::getenv("NR_EXP_NOHI"))))
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const auto it = lay[k]->s ? g_nohi_heads.find({lay[k]->s->block, lay[k]->s->layer}) : g_nohi_heads.end();
+                        const uint32_t hm = it == g_nohi_heads.end() ? 0u : it->second;
+                        std::memcpy(recs.data() + size_t(k) * sizeof(PersistRec) + 22 * 4, &hm, 4);
+                    }
                 // The workgroup count. Items are claimed off a counter now, so
                 // this is a throughput choice and no longer a correctness one:
                 // a claimed item's owner is resident by construction, whatever
@@ -3288,10 +3494,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 uint32_t wgo = wg_override;
                 // Diagnostic: per-width override NR_PERSIST_WG_<C>.
                 if (const char* e = std::getenv(("NR_PERSIST_WG_" + std::to_string(C)).c_str())) wgo = uint32_t(std::atoi(e));
-                // C=64 runs of up to 4096 windows a layer take 384 workgroups, six
-                // a CU instead of eight: fewer starved young ones (1080p -5 us a
-                // run; at 4K, 8 of them a CU are faster by 10).
-                if (!wgo && C == 64 && most <= 4096u) wgo = 384u;
+                // research: NR_PERSIST_WG_DS<C> overrides the DS-last (encoder) run only.
+                if (ds_fold)
+                    if (const char* e = std::getenv(("NR_PERSIST_WG_DS" + std::to_string(C)).c_str())) wgo = uint32_t(std::atoi(e));
+                // C=64 runs used to take 384 workgroups (six a CU) up to 4096
+                // windows a layer. With the tile counters around the runs the cap,
+                // eight a CU, is faster at every such extent: 1080p -0.012 ms,
+                // 1440p -0.020, 2560x1080 -0.023 (game path 1080p -0.009, 1440p
+                // -0.031), 720p / 1707x960 tie, byte-identical.
                 uint32_t wg = std::min(most, wgo ? wgo : cap);
                 // One workgroup per item: a persistent workgroup keeps its launch
                 // age for the whole run, and oldest-first wave arbitration runs the
@@ -3425,6 +3635,23 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                             persist_err.size(), out.size());
             disp = std::move(out);
         }
+    }
+    // NR_WSHARE (research): fswin32 built with NR_WSHARE=<n> runs n windows a
+    // workgroup, one a wave, the layer's weights and bias read once into LDS.
+    // Env NR_WSHARE_FSWIN32=<n> must match the SPV's define.
+    // NR_WPW (research): fswin32 built with NR_WPW=<n> runs n windows of a row
+    // one after the other in its one wave. Env NR_WPW_FSWIN32=<n> must match.
+    if (const char* e = std::getenv("NR_WPW_FSWIN32")) {
+        const uint32_t n = uint32_t(std::atoi(e));
+        if (n > 1)
+            for (Disp& d : disp)
+                if (d.kern == "fswin32") d.gx = (d.gx + n - 1u) / n;
+    }
+    if (const char* e = std::getenv("NR_WSHARE_FSWIN32")) {
+        const uint32_t n = uint32_t(std::atoi(e));
+        if (n > 1)
+            for (Disp& d : disp)
+                if (d.kern == "fswin32") d.gx = (d.gx + n - 1u) / n;
     }
 
     if (arena_probe) {
@@ -3622,6 +3849,102 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // index in the weight blob of its record {wait counters, need, tile table
     // (weight blob, ~0 = no wait), signal counters, epoch word, error word};
     // counters and error words live after the activation arena (zero-filled).
+    // NR_VIT_SPLIT (research, offline --no-reuse): the ViT's token-local
+    // GEMMs (expand, contraction, QKV, projection) in two token halves, ordered
+    // E_A C_A E_B Q_A C_B Q_B | barrier | attention P_A P_B, so the A half's
+    // older waves finish first (oldest-first arbitration) and the B half fills
+    // the stage changes. Each half waits on its own producer half through tile
+    // counters; the projections wait on their half of the attention's tiles.
+    bool vit_split = false;
+    if (std::getenv("NR_VIT_SPLIT") && std::atoi(std::getenv("NR_VIT_SPLIT")) && NR_TCHAIN_TILES && tchain_active() &&
+        flag(argc, argv, "--no-reuse")) {
+        auto vit_gemm = [](const Disp& d) {
+            return d.s && d.s->type.rfind("CCVit1D", 0) == 0 &&
+                   (d.kern == "gemmvact" || d.kern == "gemmproj" || d.kern == "gemmprojh" ||
+                    d.kern == "gemmvqkvnorm" || d.kern == "gemmvqkvnorms");
+        };
+        auto halve = [](const Disp& d, int h) {
+            Disp o = d; PushGemm g{}; std::memcpy(&g, d.push.data(), sizeof g);
+            const uint32_t half = g.M / 2u;
+            const uint32_t xo = (half / 16u) * (g.K / 16u) * 256u, oo = (half / 16u) * (g.N / 16u) * 256u;
+            if (h) { g.x_off += xo; g.o_off += oo; if (d.kern == "gemmproj" || d.kern == "gemmprojh") g.r_off += oo; }
+            g.M = half; o.gx = d.gx / 2u; o.split = 1 + h;
+            std::memcpy(o.push.data(), &g, sizeof g);
+            return o;
+        };
+        bool ok = true; size_t first = disp.size();
+        for (size_t i = 0; i < disp.size(); ++i) if (vit_gemm(disp[i])) {
+            first = std::min(first, i);
+            PushGemm g{}; std::memcpy(&g, disp[i].push.data(), sizeof g);
+            if (g.M > 768u || g.M % 64u || disp[i].gx % 2u || disp[i].push.size() < sizeof g) ok = false;
+        }
+        if (ok && first < disp.size()) {
+            std::vector<Disp> out(disp.begin(), disp.begin() + first);
+            size_t i = first;
+            int pA = -2, pB = -2;                      // previous layer's projection halves (-2: barrier before)
+            while (i < disp.size() && (vit_gemm(disp[i]) || disp[i].kern == "vitattn")) {
+                // one layer: E C Q A P (P may be gemmprojt, the last, unsplit)
+                if (i + 4 >= disp.size() || disp[i].kern != "gemmvact" || disp[i + 3].kern != "vitattn") { ok = false; break; }
+                const Disp &E = disp[i], &C = disp[i + 1], &Q = disp[i + 2], &A = disp[i + 3], &P = disp[i + 4];
+                const size_t b = out.size();
+                Disp eA = halve(E, 0), cA = halve(C, 0), eB = halve(E, 1), qA = halve(Q, 0), cB = halve(C, 1), qB = halve(Q, 1);
+                eA.tc_prod = pA; eB.tc_prod = pB;
+                cA.tc_prod = int(b + 0); qA.tc_prod = int(b + 1); cB.tc_prod = int(b + 2); qB.tc_prod = int(b + 4);
+                for (Disp* d : {&eA, &cA, &eB, &qA, &cB, &qB}) out.push_back(*d);
+                out.back().split = 9;                  // the barrier after Q_B stays
+                Disp a = A; a.tc_prod = -2; out.push_back(a);
+                const size_t ia = out.size() - 1;
+                if (vit_gemm(P)) {
+                    Disp p0 = halve(P, 0), p1 = halve(P, 1);
+                    p0.tc_prod = int(ia); p1.tc_prod = int(ia);
+                    PushGemm g{}; std::memcpy(&g, P.push.data(), sizeof g);
+                    p1.tc_off = (g.M / 2u) / 16u;
+                    out.push_back(p0); pA = int(out.size() - 1);
+                    out.push_back(p1); pB = int(out.size() - 1);
+                    i += 5;
+                } else { Disp pp = P; pp.tc_prod = int(ia); out.push_back(pp); i += 5; break; }   // last layer
+            }
+            if (ok) {
+                const size_t nsplit = out.size();
+                out.insert(out.end(), disp.begin() + i, disp.end());
+                std::printf("NR_VIT_SPLIT: %zu -> %zu dispatches (ViT %zu..%zu)\n", disp.size(), out.size(), first, nsplit);
+                disp.swap(out); vit_split = true;
+            }
+        }
+        if (!ok) std::printf("NR_VIT_SPLIT: shape not supported, off\n");
+    }
+    // dead padded rows. The working extent is padded to 64 rows (4K: 2176
+    // for 2160), and a window row of the post block that starts at or past the
+    // picture's last row writes nothing the frame keeps. Its input rows past the
+    // live windows' last one are then dead in the half-resolution layer before
+    // it (nearest 2x gather), and that layer's window rows that start there too.
+    // Output unchanged by construction. NR_DEAD_ROWS=0 keeps the full grids.
+    if (g_post_out_h && !(std::getenv("NR_DEAD_ROWS") && !std::atoi(std::getenv("NR_DEAD_ROWS"))))
+        for (size_t i = 0; i < disp.size(); ++i) {
+            if (disp[i].kern != "fswinimagepost32") continue;
+            PushFSwin fs{}; std::memcpy(&fs, disp[i].push.data(), sizeof fs);
+            const int lim = int(g_post_out_h) - 4 * fs.shift_y;          // live: 8 wy + 4 shift_y < H
+            const uint32_t gy = std::min(disp[i].gy, uint32_t(std::max(1, (lim + 7) / 8)));
+            int rows = 8 * int(gy) + 4 * fs.shift_y;                      // full-res rows the live windows read
+            std::printf("dead rows: post %u -> %u window rows\n", disp[i].gy, gy);
+            disp[i].gy = gy;
+            PushUps pu{}; std::memcpy(&pu, disp[i].push.data() + sizeof(PushFSwin), sizeof pu);
+            uint32_t in_off = pu.p_off;
+            rows = (rows + 1) / 2;                                        // half-res rows read
+            // Back through the plain C=32 layers of that level (each reads only its
+            // predecessor's output): the same rule at one resolution.
+            for (size_t j = i; j-- > 0 && disp[j].kern == "fswin32";) {
+                PushFSwin f2{}; std::memcpy(&f2, disp[j].push.data(), sizeof f2);
+                if (f2.o_off != in_off) break;
+                const uint32_t g2 = std::min(disp[j].gy, uint32_t(std::max(1, (rows - 4 * f2.shift_y + 7) / 8)));
+                std::printf("dead rows: %s %u -> %u window rows\n", disp[j].kern.c_str(), disp[j].gy, g2);
+                if (g2 == disp[j].gy) break;
+                disp[j].gy = g2;
+                rows = 8 * int(g2) + 4 * f2.shift_y;
+                in_off = f2.x_off;
+            }
+            break;
+        }
     g_tc_nobar.assign(disp.size(), 0);
     g_tc_words.clear();
     g_tc_err.clear();
@@ -3653,6 +3976,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushPersist pp{}; std::memcpy(&pp, d.push.data(), sizeof pp);
                 big_frame = big_frame || (pp.n_layers && pp.total_windows / pp.n_layers > 4096u);
             }
+        // research: NR_TC_BIG=1 keeps the persistent-run chains at 4K too.
+        if (std::getenv("NR_TC_BIG") && std::atoi(std::getenv("NR_TC_BIG"))) big_frame = false;
         auto wword = [&](uint32_t i) { uint32_t v; std::memcpy(&v, wblob.data() + size_t(i) * 4, 4); return v; };
         // The activation a dispatch reads from its predecessor / writes for its
         // successor. A persistent run: its last layer's output, its UPS layer's
@@ -3691,8 +4016,21 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         };
         // A gemm1x1 producer's M tile (token rows) and waves along N (each wave
         // signals every token tile of the M tile), per pipeline.
-        auto gemm_mt_wn = [](const std::string& k) -> std::pair<uint32_t, uint32_t> {
+        // SPVs built with NR_TC_WG_SIGNAL (gemm1x1 signals once a workgroup) carry a
+        // tc_wgsig marker in their directory; their counters complete at gy, not gy*WN.
+        static const bool wgsig = std::filesystem::exists(spv_dir + "/tc_wgsig");
+        auto gemm_mt_wn = [&](const std::string& k) -> std::pair<uint32_t, uint32_t> {
+            if (wgsig) {
+                if (k == "gemmvqkvnorms") return {NR_GEMM_QKVS_MT, 1u};
+                if (k == "gemmvact" || k == "gemmvqkvnorm") return {NR_GEMM_WIDE_MT, 1u};
+                if (k == "gemmvacts") return {32u, 1u};
+                if (k == "gemmprojw") return {NR_GEMM_PROJW_MT, 1u};
+                return {NR_GEMM_PROJ_MT, 1u};
+            }
+            if (k == "gemmvqkvnorms") return {NR_GEMM_QKVS_MT, NR_GEMM_QKVS_WN};
+            if (NR_VIT_CT41 && k == "gemmprojh") return {64u, 4u};
             if (k == "gemmvact" || k == "gemmvqkvnorm") return {NR_GEMM_WIDE_MT, NR_GEMM_WIDE_NT / 64};
+            if (k == "gemmvacts") return {32u, NR_GEMM_WIDE_NT / 64};
             if (k == "gemmprojw") return {NR_GEMM_PROJW_MT, NR_GEMM_PROJW_NT / 64};
             return {NR_GEMM_PROJ_MT, NR_GEMM_PROJ_NT / 32};   // gemmproj, gemmprojc, gemmprojt
         };
@@ -3700,6 +4038,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // ViT one; the decoder's upsample levels take their own raster (4K C=64: 32640).
         for (size_t i = 0; on && i + 1 < disp.size(); ++i) {
             const Disp& P = disp[i]; Disp& Q = disp[i + 1];
+            if (vit_split && (Q.tc_prod != -1 || P.split || Q.split)) continue;   // linked below
             if (!tchain_pair(P.kern, Q.kern)) continue;
             if (tick > i) continue;   // no frame tick before this pair
             // The persistent runs' boundaries pay where the runs are short: 1080p
@@ -3711,7 +4050,21 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             auto run_kern = [](const std::string& k) {
                 return is_persist_kern(k) || k == "fswinfusedup32" || k == "fswindsp32";
             };
-            if (big_frame && (run_kern(P.kern) || run_kern(Q.kern))) continue;
+            // research: NR_TC_BIG_ALLOW="P>Q,P>Q" keeps the named pairs chained on big frames.
+            // Default : the decoder's C=128 -> C=64 and
+            // C=64 -> C=32 fused-upsample links and the encoder's C=128 -> C=256 link stay chained
+            // on big frames, and so does the C=256 run -> the first C=512 FFN (-24 us cycles);
+            // C=256 -> C=128 (+52 us) and the rest do not.
+            const char* big_allow = std::getenv("NR_TC_BIG_ALLOW") ? std::getenv("NR_TC_BIG_ALLOW")
+                : "fswinpup64>fswinfusedup32+fswinpup128>fswinpup64+fswinpds128>fswinpds256+fswinpds256>ffwd3w";
+            bool big_ok = false;
+            if (const char* e = big_allow) {
+                std::string al = std::string(",") + e + ",";
+                for (char& ch : al) if (ch == '+') ch = ',';
+                const std::string pq = "," + P.kern + ">" + Q.kern + ",";
+                big_ok = al.find(pq) != std::string::npos;
+            }
+            if (big_frame && !big_ok && (run_kern(P.kern) || run_kern(Q.kern))) continue;
             if (std::getenv("NR_TCHAIN_DEBUG")) {
                 uint32_t a = 0, b = 0; const bool ok = (is_persist_kern(Q.kern) || Q.kern == "fswinfusedup32") ? ups_grid(Q, a, b) : true;
                 std::printf("tchain? %s -> %s: out %u in %u grid %u/%u ok %d\n", P.kern.c_str(), Q.kern.c_str(), io(P, true), io(Q, false), a, b, int(ok));
@@ -3809,6 +4162,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 pg.remap = 1u;
                 std::memcpy(Q.push.data(), &pg, sizeof pg);
             }
+            // diagnostic NR_DIAG_VIT_FREE=1 (wrong picture): ViT consumers wait for nothing -
+            // with --no-barrier-after on the ViT kernels, the bound of every ViT stage boundary.
+            if (std::getenv("NR_DIAG_VIT_FREE") && (std::atoi(std::getenv("NR_DIAG_VIT_FREE")) & 1) &&
+                Q.s && Q.s->type.rfind(std::getenv("NR_DIAG_FREE_TYPE") ? std::getenv("NR_DIAG_FREE_TYPE") : "CCVit1D", 0) == 0)
+                std::fill(t.begin(), t.end(), 0xFFFFFFFFu);
             for (uint32_t k = 0; k < uint32_t(t.size()); ++k)
                 if (t[k] != 0xFFFFFFFFu)
                     tc_expect.push_back({cnt - uint32_t(g_tc_base) + (t[k] & 0xFFFFFu), t[k] >> 20, uint32_t(tc_pair.size())});
@@ -3817,6 +4175,45 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             rec[i + 1][0] = cnt; rec[i + 1][2] = putw(t.data(), t.size() * 4);
             rec[i + 1][5] = err;
             g_tc_nobar[i] = 1; ++nch;
+        }
+        // NR_VIT_SPLIT: explicit links (producer tc_prod -> this dispatch,
+        // local tile k reads producer tile k + tc_off); one counter array per
+        // producer, shared by its consumers.
+        if (on && vit_split) {
+            std::map<int, uint32_t> pcnt;
+            for (size_t qi = 0; qi < disp.size(); ++qi) {
+                Disp& Q = disp[qi];
+                if (Q.tc_prod >= 0) {
+                    const Disp& P = disp[size_t(Q.tc_prod)];
+                    uint32_t ntile = 0, need = 0;
+                    if (P.kern.rfind("gemm", 0) == 0) { const auto mw = gemm_mt_wn(P.kern); ntile = P.gx * (mw.first / 16u); need = P.gy * mw.second; }
+                    else if (P.kern == "vitattn") { PushVAttn pv{}; std::memcpy(&pv, P.push.data(), sizeof pv); ntile = (pv.tokens + 15u) / 16u; need = P.gy; }
+                    else throw std::runtime_error("NR_VIT_SPLIT: unexpected producer " + P.kern);
+                    if (!pcnt.count(Q.tc_prod)) {
+                        g_tc_err.push_back(g_tc_words.size()); g_tc_words.push_back(0u);
+                        const uint32_t cnt = uint32_t(g_tc_base + g_tc_words.size());
+                        g_tc_words.insert(g_tc_words.end(), size_t(ntile), 0u);
+                        pcnt[Q.tc_prod] = cnt; rec[size_t(Q.tc_prod)][3] = cnt;
+                    }
+                    const uint32_t cnt = pcnt[Q.tc_prod];
+                    PushGemm qg{}; std::memcpy(&qg, Q.push.data(), sizeof qg);
+                    const uint32_t qt = Q.kern.rfind("gemm", 0) == 0 ? (qg.M + 15u) / 16u : 0u;
+                    if (!qt || qt + Q.tc_off > ntile) throw std::runtime_error("NR_VIT_SPLIT: tile range");
+                    std::vector<uint32_t> t(4096, 0xFFFFFFFFu);
+                    for (uint32_t k = 0; k < qt; ++k) {
+                        t[k] = (k + Q.tc_off) | (need << 20);
+                        tc_expect.push_back({cnt - uint32_t(g_tc_base) + k + Q.tc_off, need, uint32_t(tc_pair.size())});
+                    }
+                    tc_pair.push_back(P.kern + " => " + Q.kern);
+                    const uint32_t err = uint32_t(g_tc_base + g_tc_words.size());
+                    g_tc_err.push_back(g_tc_words.size()); g_tc_words.push_back(0u);
+                    rec[qi][0] = cnt; rec[qi][2] = putw(t.data(), t.size() * 4); rec[qi][5] = err;
+                    ++nch;
+                }
+                // every barrier inside the split stretch goes but the one before the attention
+                const bool in_split = Q.split != 0 || (Q.kern == "vitattn" && qi + 1 < disp.size() && disp[qi + 1].tc_prod == int(qi));
+                if (in_split && Q.split != 9) g_tc_nobar[qi] = 1;
+            }
         }
         for (size_t i = 0; i < disp.size(); ++i) {
             if (!tchain_kern(disp[i].kern)) continue;
@@ -4050,6 +4447,39 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (aliased)
             std::fprintf(stderr, "  ** %d dispatches alias their own input **\n", aliased);
     }
+    // NR_EXP_NOHI: the plain C=32 kernels of audited steps take the variant
+    // built without the (never reached) upper exponent clamp. NR_EXP_NOHI=0 keeps them.
+    if (!(std::getenv("NR_EXP_NOHI") && !std::atoi(std::getenv("NR_EXP_NOHI")))) {
+        int n = 0;
+        for (Disp& d : disp)
+            if ((d.kern == "fswin32" || d.kern == "fswindsp32" || d.kern == "fswinfusedup32" ||
+                 d.kern == "fswinimagepreds32") && d.s &&
+                g_nohi.count({d.s->block, d.s->layer}) &&
+                // fswinfusedup32nh is also built without the tile tests (NR_PRE_FULL=3):
+                // only for an unshifted grid that covers the tile raster exactly.
+                (d.kern != "fswinfusedup32" || [&] { PushFSwin f{}; std::memcpy(&f, d.push.data(), sizeof f);
+                    return f.shift == 0 && f.shift_y == 0 && f.tiles_x == 2u * d.gx && f.tiles_y == 2u * d.gy; }()) &&
+                std::filesystem::exists(spv_dir + "/g_" + d.kern + "nh.spv")) { d.kern += "nh"; ++n; }
+        if (n) std::printf("exp upper clamp dead (weights): %d C=32 dispatches\n", n);
+    }
+    // NR_REV_C32 (research): plain C=32 layers that take their windows from the
+    // last to the first (NR_REV_Y pipelines). "1" alternates: a plain layer right
+    // after a forward C=32 kernel walks backwards; otherwise a list of block ids.
+    if (const char* e = std::getenv("NR_REV_C32")) {
+        std::set<int> blocks; bool alt = std::string(e) == "1";
+        if (!alt) for (const char* q = e; *q; ) { blocks.insert(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        bool prev_fwd = false; int n = 0;
+        for (Disp& d : disp) {
+            const bool c32 = d.kern.rfind("fswin32", 0) == 0 || d.kern.rfind("fswinimagepreds32", 0) == 0 ||
+                             d.kern.rfind("fswinfusedup32", 0) == 0 || d.kern.rfind("fswindsp32", 0) == 0;
+            bool rev = false;
+            if ((d.kern == "fswin32" || d.kern == "fswin32nh") && d.s &&
+                (alt ? prev_fwd : blocks.count(d.s->block) != 0) &&
+                std::filesystem::exists(spv_dir + "/g_" + d.kern + "rv.spv")) { d.kern += "rv"; rev = true; ++n; }
+            prev_fwd = c32 && !rev;
+        }
+        std::printf("C=32 layers walking backwards: %d\n", n);
+    }
     // ---- pipelines ---------------------------------------------------------
     // Bindings differ per shader and the buffers do not: every kernel in this
     // project reaches both arenas through push-constant offsets, which is what
@@ -4060,7 +4490,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (d.kern.rfind("fswindsp",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
                                 sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
-        else if (d.kern=="fswinimagepreds32")
+        else if (d.kern.rfind("fswinimagepreds32",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
                                 sizeof(PushFSwin)+sizeof(PushPreImage),{&tex_in});
         else if (d.kern=="fswinimagepost32")
@@ -4105,7 +4535,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         else if (d.kern == "attn")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
                                          wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
-        else if (d.kern == "ffwd3" || d.kern == "ffwd3w")
+        else if (d.kern == "ffwd3" || d.kern == "ffwd3w" || d.kern == "ffwd3q")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle,
                                          wgt.handle, wgt.handle, act.handle},
                                 sizeof(PushFfwd3) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
@@ -4312,7 +4742,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (runner.no_barrier_after.size() != disp.size()) runner.no_barrier_after.assign(disp.size(), 0);
         for (size_t i = 0; i < disp.size(); ++i) if (g_tc_nobar[i]) runner.no_barrier_after[i] = 1;
     }
-    // Diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
+    if (std::getenv("NR_DIAG_VIT_FREE") && (std::atoi(std::getenv("NR_DIAG_VIT_FREE")) & 2)) {   // diagnostic: no ViT barriers
+        if (runner.no_barrier_after.size() != disp.size()) runner.no_barrier_after.assign(disp.size(), 0);
+        for (size_t i = 0; i + 1 < disp.size(); ++i)
+            if (disp[i + 1].s && disp[i + 1].s->type.rfind(std::getenv("NR_DIAG_FREE_TYPE") ? std::getenv("NR_DIAG_FREE_TYPE") : "CCVit1D", 0) == 0 &&
+                (!(std::atoi(std::getenv("NR_DIAG_VIT_FREE")) & 4) || disp[i + 1].kern == "vitattn") &&
+                (!(std::atoi(std::getenv("NR_DIAG_VIT_FREE")) & 8) || disp[i].s->type.rfind("CCVit1D", 0) != 0))
+                runner.no_barrier_after[i] = 1;
+    }
+    // diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
     // layers only), so the second copy shows the kernel with warm caches.
     const std::string dupk = std::getenv("NR_DUP") ? std::string(",") + std::getenv("NR_DUP") + "," : "";
     for (const Disp& d : disp) {

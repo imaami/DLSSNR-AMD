@@ -122,7 +122,23 @@ uint nr_at16(uint base, uint token, uint ch, uint C) {
 // exponent field leaves behind. Masking first bounds each half by 0x3E90, so
 // the packed shift cannot carry either. (NaN reaches the same answer by the
 // same identity: 0x7E00 also has both bits set.)
+// Windows (LLPC) NR_VEXP_I16: the clamp on the half bit patterns as signed 16-bit integers.
+// LLPC turns the f16 pair clamp into a v_med3_num_f16 per half with the unpack and repack
+// around it; on bits it is one v_pk_max_i16 + one v_pk_min_i16. For every non-NaN half the
+// signed order of the patterns is the order of the values on [lo, hi] (all negatives, -0
+// included, sit below lo = 0x3DC2), so the clamped bits are the same. NaN only differs.
+#ifndef NR_VEXP_I16
+#define NR_VEXP_I16 0
+#endif
+#if NR_VEXP_I16
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
 f16vec2 nr_vit_exp2(vec2 x) {
+#if NR_VEXP_I16
+    const f16vec2 y0 = fma(f16vec2(x), f16vec2(NR_F16(0.08953857421875)), f16vec2(NR_F16(1.708984375)));
+    const i16vec2 yb = min(max(float16BitsToInt16(y0), i16vec2(int16_t(0x3DC2))), i16vec2(int16_t(0x3FE9)));
+    return unpackFloat2x16((pack32(u16vec2(yb)) << 4u) + 0x3FFC4000u);
+#else
     const f16vec2 y = clamp(fma(f16vec2(x), f16vec2(NR_F16(0.08953857421875)),
                                             f16vec2(NR_F16(1.708984375))),
                             f16vec2(NR_F16(1.439453125)),
@@ -130,6 +146,7 @@ f16vec2 nr_vit_exp2(vec2 x) {
     // (h<<4) + 0x3FFC4000 == (h & 0x03ff03ff) << 4 for exponent-15 halves:
     // 0x3C00<<4 = 0x3C000 per half, and the high field wraps to 0xC0000000.
     return unpackFloat2x16((packFloat2x16(y) << 4u) + 0x3FFC4000u);
+#endif
 }
 
 // **There is no output permutation.** An earlier probe read one - head h's dims

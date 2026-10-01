@@ -1009,9 +1009,12 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
     feed(rt, cl, rtv);
 }
 
+// MinHook is ours (linked into this module) and was started for the device watch.
+bool minhook_initialized = false;
+
 }  // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         nr::pe::set_module(module);
         if (!reshade::register_addon(module)) return FALSE;
@@ -1028,11 +1031,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // ReShade as a Vulkan layer loads add-ons inside its vkCreateInstance
         // hook: vulkan-1.dll is in the process and the game's vkCreateDevice
         // has not happened yet, which is exactly when the device watcher's
-        // hooks have to go in. When ReShade is dxgi.dll instead, vulkan-1 is
-        // absent and nothing is hooked.
+        // hooks have to go in. ReShade as dxgi.dll over DXVK/vkd3d-proton finds
+        // vulkan-1 loaded as well; the hooks are harmless there, as long as
+        // they leave with the add-on (DLL_PROCESS_DETACH below).
         if (GetModuleHandleW(L"vulkan-1.dll")) {
             const MH_STATUS mh = MH_Initialize();
             if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
+                minhook_initialized = true;
                 log("[nr] vulkan-1.dll is loaded: watching the game's device creation (%s)",
                     nr::pe::vkdevice::install() ? "hooks installed" : "hooks FAILED");
                 nr::pe::vkdevice::set_device_callback(on_vulkan_device_created);
@@ -1048,6 +1053,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         reshade::register_overlay(nullptr, draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
     } else if (reason == DLL_PROCESS_DETACH) {
+        // ReShade unloads add-ons when its last device is destroyed, and the
+        // game goes on: the vulkan-1 hooks must not outlive this module. At
+        // process exit (reserved != null) the other threads are gone and
+        // nothing calls into vulkan-1 any more, so it is left alone.
+        if (minhook_initialized && !reserved) {
+            nr::pe::vkdevice::uninstall();
+            MH_Uninitialize();
+            minhook_initialized = false;
+        }
         reshade::unregister_overlay(nullptr, draw_overlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
         // First: the filter lives in code that is about to be unmapped.

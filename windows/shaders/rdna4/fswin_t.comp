@@ -631,6 +631,76 @@ float nr_fdot2mix(f16vec2 a, f16vec2 b, float acc);
 // the swapped V goes to lds_v as before, stored ColumnMajor - the same
 // addresses, but a lane's eight bytes are now contiguous (one ds_store_b64).
 #define NR_V_REGS (NR_V_SWAP && (NR_HWAVES || NR_MF == NR_JF))
+// Windows (LLPC) NR_V_LDS_ROW: the head-split V tiles in lds_y stored RowMajor and read back
+// as a RowMajor A operand. ColumnMajor both ways puts element (r, c) at c*16 + r either way,
+// RowMajor at r*16 + c: the same element reaches the same A position. But a ColumnMajor A load
+// gathers a lane's eight bytes 16 apart - LLPC issues eight ds_load_u8 and reassembles them in
+// front of the WMMA - where RowMajor reads them as one 8-byte word; the scattered bytes move to
+// the stores, which nothing waits on.
+// Windows diagnostic (NR_PROF builds of persistent runs only): an item's time to each stage
+// boundary, tag 0x80000000 | stage << 28 | sync_off (stage 0 is the item's end record).
+#if NR_PERSIST && defined(NR_PROF_OFF) && defined(NR_PROF_STAGES)
+#define NR_PROF_STAGE(s) NR_PROF_REC(0x80000000u | (uint(s) << 28u) | pcp.sync_off, nr_item, nr_prof_tm, nr_prof_cm)
+// Inside the head loop: the last head only (4 = logits, 5 = context product).
+#define NR_PROF_STAGE_LAST(s) if (hh == NR_HEADS - 1) { NR_PROF_STAGE(s) }
+#else
+#define NR_PROF_STAGE(s)
+#define NR_PROF_STAGE_LAST(s)
+#endif
+// Windows (LLPC) NR_KFENCE_MASK: a wave-scope shared-memory barrier at the end of each k step of
+// the selected GEMM loops (8 QK pass, 16 V pass), so LLVM cannot hoist every k step's LDS
+// fragment loads ahead of the first WMMA (the register peak of the head-split bodies). Changes
+// no value.
+#ifndef NR_ESPLIT
+#define NR_ESPLIT 0
+#endif
+#ifndef NR_VPASS_SPLIT
+#define NR_VPASS_SPLIT 0
+#endif
+#ifndef NR_KFENCE_MASK
+#define NR_KFENCE_MASK 0
+#endif
+#define NR_KFENCE(bit) NR_KFENCE_##bit
+#if (NR_KFENCE_MASK) & 1
+#define NR_KFENCE_1 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_1
+#endif
+#if (NR_KFENCE_MASK) & 2
+#define NR_KFENCE_2 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_2
+#endif
+#if (NR_KFENCE_MASK) & 4
+#define NR_KFENCE_4 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_4
+#endif
+#if (NR_KFENCE_MASK) & 8
+#define NR_KFENCE_8 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_8
+#endif
+#if (NR_KFENCE_MASK) & 16
+#define NR_KFENCE_16 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_16
+#endif
+#if (NR_KFENCE_MASK) & 32
+#define NR_KFENCE_32 subgroupMemoryBarrierShared();
+#else
+#define NR_KFENCE_32
+#endif
+#ifndef NR_V_LDS_ROW
+#define NR_V_LDS_ROW 0
+#endif
+#if NR_V_LDS_ROW
+#define NR_V_LDS_STORE(frag, arr, off, stride) NR_STORE_ACC(frag, arr, off, stride)
+#define NR_V_LDS_LOAD(frag, arr, off, stride)  NR_LOAD_A(frag, arr, off, stride)
+#else
+#define NR_V_LDS_STORE(frag, arr, off, stride) NR_STORE_ACC_COL(frag, arr, off, stride)
+#define NR_V_LDS_LOAD(frag, arr, off, stride)  NR_LOAD_A_COL(frag, arr, off, stride)
+#endif
 #if NR_K_REGS && (NR_MF < NR_JF)
 #error "NR_K_REGS needs one wave per window (NR_MF >= NR_JF): NR_FWAVES=1 or NR_HWAVES=1"
 #endif
@@ -1026,7 +1096,7 @@ fe4m3vec4 nr_qscale_fast4(vec2 va, float na, float16_t sa, vec2 vb, float nb, fl
 #if NR_QK_SCALE_FAST == 5 && NR_QK_SAT && NR_QUANT_EXPLICIT
     return nr_quant_quad32(va * (na * float(sa)), vb * (nb * float(sb)));
 #elif NR_QK_SCALE_FAST == 5 && !NR_QK_SAT
-    return fe4m3vec4(vec4(va * (na * float(sa)), vb * (nb * float(sb))));
+    return NR_CVT4(vec4(va * (na * float(sa)), vb * (nb * float(sb))));
 #else
     const fe4m3vec2 p = nr_qscale_fast(va, na, sa), q = nr_qscale_fast(vb, nb, sb);
     return fe4m3vec4(p.x, p.y, q.x, q.y);
@@ -1036,7 +1106,7 @@ fe4m3vec4 nr_kscale_fast4(vec2 va, float na, vec2 vb, float nb) {
 #if NR_QK_SCALE_FAST == 5 && NR_QK_SAT && NR_QUANT_EXPLICIT
     return nr_quant_quad32(va * na, vb * nb);
 #elif NR_QK_SCALE_FAST == 5 && !NR_QK_SAT
-    return fe4m3vec4(vec4(va * na, vb * nb));
+    return NR_CVT4(vec4(va * na, vb * nb));
 #else
     const fe4m3vec2 p = nr_kscale_fast(va, na), q = nr_kscale_fast(vb, nb);
     return fe4m3vec4(p.x, p.y, q.x, q.y);
@@ -1355,10 +1425,10 @@ fe4m3vec2 nr_quant_pair_h(f16vec2 v) {
 #define NR_WPF_PRIME(pipe, ntot, ADDR)                                        \
     for (int wpfp_ = 0; wpfp_ < NR_WPF; ++wpfp_)                              \
         if (wpfp_ < (ntot))                                                   \
-            NR_LOAD_A(pipe[wpfp_ % NR_WPF_SLOTS], NR_WARENA, ADDR(wpfp_), 16u);
+            NR_LOAD_WA(pipe[wpfp_ % NR_WPF_SLOTS], ADDR(wpfp_), 16u);
 #define NR_WPF_STEP(pipe, i, ntot, ADDR)                                      \
     if ((i) + NR_WPF < (ntot))                                                \
-        NR_LOAD_A(pipe[((i) + NR_WPF) % NR_WPF_SLOTS], NR_WARENA,             \
+        NR_LOAD_WA(pipe[((i) + NR_WPF) % NR_WPF_SLOTS],             \
                   ADDR((i) + NR_WPF), 16u);
 #define NR_WPF_AT(pipe, i) pipe[(i) % NR_WPF_SLOTS]
 #endif
@@ -1438,9 +1508,68 @@ layout(set = 0, binding = 0, std430) NR_COH    buffer ActE4M3v { uint act_v4[]; 
 #define NR_LOAD_B_ACT(frag, off, stride) \
     coopMatLoad(frag, act_v4, (off) / 4u, (stride) / 4u, gl_CooperativeMatrixLayoutColumnMajor)
 #endif
+// Windows (LLPC) NR_WIN_ST8: in a persistent run the arena is coherent and LLPC stores an e4m3
+// fragment (or vector) one atomic byte at a time (325 buffer_store_b8 in fswinpds*). The same
+// eight bytes a lane through a coherent uvec2 view are one store: an e4m3 Accumulator stored
+// ColumnMajor puts lane l's components at column l%16, rows 8*(l/16)..+7, i.e. eight contiguous
+// bytes at off + (l%16)*stride + 8*(l/16) (the layout NR_LOAD_B_ACT reads). Same bytes, same order.
+#ifndef NR_WIN_ST8
+#define NR_WIN_ST8 0
+#endif
+#if NR_WIN_ST8 && !NR_PERSIST
+#error "NR_WIN_ST8: persistent runs only"
+#endif
+// Windows (LLPC): elements c, c+1 of an e4m3 fragment (c even) as f32, through the four-wide
+// conversion of their dword. LLPC turns each scalar e4m3 -> f32 conversion into a byte extract
+// and a v_cvt_f32_fp8 (a pair into a byte repack); four in order are two v_cvt_pk_f32_fp8.
+// Exact either way. The two calls of a dword share the conversion after unrolling.
+vec2 nr_e4f2_pick(vec4 v, int c) { return (c & 2) != 0 ? v.zw : v.xy; }
+#define NR_E4F2(frag, c) nr_e4f2_pick(vec4(fe4m3vec4((frag)[(c) & ~3], (frag)[((c) & ~3) + 1], \
+    (frag)[((c) & ~3) + 2], (frag)[((c) & ~3) + 3])), (c))
+uint nr_e4m3x4_bits(fe4m3vec4 v) {
+    return pack32(u8vec4(floate4m3BitsToUintEXT(v.x), floate4m3BitsToUintEXT(v.y),
+                         floate4m3BitsToUintEXT(v.z), floate4m3BitsToUintEXT(v.w)));
+}
+#if NR_WIN_ST8
+layout(set = 0, binding = 0, std430) coherent buffer ActE4M3v8 { uvec2 act_v8[]; };
+#define NR_STORE_ACT_COL(frag, off, stride) do { \
+    const uint nr_sa = ((off) + (gl_SubgroupInvocationID % 16u) * (stride) + (gl_SubgroupInvocationID / 16u) * 8u) / 8u; \
+    act_v8[nr_sa] = uvec2(nr_e4m3x4_bits(fe4m3vec4(frag[0], frag[1], frag[2], frag[3])), \
+                          nr_e4m3x4_bits(fe4m3vec4(frag[4], frag[5], frag[6], frag[7]))); } while (false)
+#else
+#define NR_STORE_ACT_COL(frag, off, stride) NR_STORE_ACC_COL(frag, act_e4m3, off, stride)
+#endif
 layout(set = 0, binding = 1, std430) NR_COH    buffer ActF16  { NR_F16  act_f16[]; };
 layout(set = 0, binding = 2, std430) readonly buffer WgtE4M3 { NR_E4M3 wgt_e4m3[]; };
 layout(set = 0, binding = 3, std430) readonly buffer WgtF32  { float   wgt_f32[]; };
+// Windows (LLPC): an e4m3 fragment filled from one 8-byte word (element i = byte i). In this
+// shader LLPC builds a fragment loaded from e4m3 data - coopMatLoad or element by element -
+// out of byte shuffles, and one per fragment survives as an identity
+// `v_perm_b32 vX, vX, vX, 0x3020104`, which also pulls the load's wait forward. From one
+// uvec2 through unpack8 the fragment is the loaded registers (from two separate dwords the
+// second is still assembled byte by byte). Same bytes, same order.
+#define NR_FRAG_Q(frag, v) { const uvec2 nr_fv = (v); \
+    const u8vec4 nr_f0 = unpack8(nr_fv.x), nr_f1 = unpack8(nr_fv.y); \
+    for (int nr_z = 0; nr_z < 4; ++nr_z) { \
+        (frag)[nr_z] = uintBitsToFloate4m3EXT(nr_f0[nr_z]); \
+        (frag)[nr_z + 4] = uintBitsToFloate4m3EXT(nr_f1[nr_z]); } }
+#ifndef NR_WLOAD_U32
+#define NR_WLOAD_U32 0
+#endif
+#if NR_WLOAD_U32 && NR_F16_MMA
+#error "NR_WLOAD_U32: e4m3 weights only"
+#endif
+// NR_WLOAD_U32: the RowMajor e4m3 weight fragments (NR_LOAD_WA) through NR_FRAG_Q.
+#if NR_WLOAD_U32
+// A RowMajor A fragment: lane l holds row l%16, k 8*(l/16)..+7 - eight contiguous bytes at
+// off + (l%16)*stride + 8*(l/16) (8-aligned: tile offsets and 16-byte rows). One uvec2 load,
+// unpacked in place (NR_FRAG_Q); a coopMatLoad from this view is assembled byte by byte too.
+layout(set = 0, binding = 2, std430) readonly buffer WgtE4M3w { uvec2 wgt_w8[]; };
+#define NR_LOAD_WA(frag, off, stride) NR_FRAG_Q(frag, wgt_w8[((off) + \
+    (gl_SubgroupInvocationID % 16u) * (stride) + (gl_SubgroupInvocationID / 16u) * 8u) / 8u])
+#else
+#define NR_LOAD_WA(frag, off, stride) NR_LOAD_A(frag, NR_WARENA, off, stride)
+#endif
 layout(set = 0, binding = 4, std430) readonly buffer WgtF16  { NR_F16  wgt_f16[]; };
 // **The same bytes, read 32 bits at a time.** The fused RGB projection's 128
 // weights are wave-uniform - the index is a push constant plus an unrolled
@@ -1483,6 +1612,80 @@ layout(set=0,binding=4,std430) readonly buffer ActLut4 { fe4m3vec4 act_lut4[]; }
 #endif
 #if ((defined(NR_PACKED_EXPAND) || defined(NR_PACKED_QKV) || NR_PACKED_DENSE) && NR_HWAVES) || NR_PACK_C32_ACTIVE
 layout(set = 0, binding = 4, std430) readonly buffer WExpandPair4 { fe4m3vec4 wexpand_pair4[]; };
+#endif
+// Windows (LLPC) NR_WPAIR_U32: the paired weight records read as 8-byte words. Assigned from
+// the fe4m3vec4 view, LLPC builds every A fragment byte by byte (eight shuffles) and leaves one
+// identity `v_perm_b32 vX, vX, vX, 0x3020104` a fragment behind; from a uvec2 through unpack8
+// the fragment is the loaded registers. Same bytes, same order.
+#ifndef NR_WPAIR_U32
+#define NR_WPAIR_U32 0
+#endif
+#if NR_WPAIR_U32
+layout(set = 0, binding = 4, std430) readonly buffer WExpandPairU { uvec2 wexpand_u2[]; };
+#endif
+// NR_WPAIR_MASK: which head-split stages fill their paired weight fragments through the uvec2
+// view (bit 1 expand, 2 middle, 4 contract, 8 QKV, 16 V, 32 output projection; the C=32
+// weights follow NR_WPAIR_U32). Per stage, because the byte-built fragments cost an identity
+// v_perm each while the uvec2 fills can lengthen live ranges past a wave threshold.
+#ifndef NR_WPAIR_MASK
+#if NR_WPAIR_U32
+#define NR_WPAIR_MASK 63
+#else
+#define NR_WPAIR_MASK 0
+#endif
+#endif
+#if NR_WPAIR_MASK && !NR_WPAIR_U32
+#error "NR_WPAIR_MASK needs NR_WPAIR_U32=1 (the uvec2 view)"
+#endif
+#define NR_WPAIR_FILL_B(frag,q) { \
+    const fe4m3vec4 lo=wexpand_pair4[q],hi=wexpand_pair4[(q)+1u]; \
+    for(int z=0;z<4;++z){(frag)[z]=lo[z];(frag)[z+4]=hi[z];} }
+#define NR_WPAIR_FILL2_B(wf0,wf1,q) { \
+    const fe4m3vec4 w0=wexpand_pair4[q],w1=wexpand_pair4[(q)+1u]; \
+    const fe4m3vec4 w2=wexpand_pair4[(q)+2u],w3=wexpand_pair4[(q)+3u]; \
+    for(int v=0;v<4;++v) { \
+        wf0[v]=w0[v]; wf0[v+4]=w1[v]; \
+        wf1[v]=w2[v]; wf1[v+4]=w3[v]; \
+    } }
+#if NR_WPAIR_U32
+// q is a dword index and even (records are 8-byte aligned).
+#define NR_WPAIR_FILL(frag,q) NR_FRAG_Q(frag, wexpand_u2[(q)/2u])
+#define NR_WPAIR_FILL2_U(wf0,wf1,q) NR_WPAIR_FILL(wf0,q) NR_WPAIR_FILL(wf1,(q)+2u)
+// Chosen by the preprocessor, one macro a stage bit (the call sites pass the literal).
+#define NR_WPAIR_FILL2S(wf0,wf1,q,bit) NR_WPAIR_F2_##bit(wf0,wf1,q)
+#if (NR_WPAIR_MASK) & 1
+#define NR_WPAIR_F2_1(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_1(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#if (NR_WPAIR_MASK) & 2
+#define NR_WPAIR_F2_2(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_2(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#if (NR_WPAIR_MASK) & 4
+#define NR_WPAIR_F2_4(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_4(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#if (NR_WPAIR_MASK) & 8
+#define NR_WPAIR_F2_8(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_8(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#if (NR_WPAIR_MASK) & 16
+#define NR_WPAIR_F2_16(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_16(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#if (NR_WPAIR_MASK) & 32
+#define NR_WPAIR_F2_32(wf0,wf1,q) NR_WPAIR_FILL2_U(wf0,wf1,q)
+#else
+#define NR_WPAIR_F2_32(wf0,wf1,q) NR_WPAIR_FILL2_B(wf0,wf1,q)
+#endif
+#else
+#define NR_WPAIR_FILL(frag,q) NR_WPAIR_FILL_B(frag,q)
+#define NR_WPAIR_FILL2S(wf0,wf1,q,bit) NR_WPAIR_FILL2_B(wf0,wf1,q)
 #endif
 #if defined(NR_POOL_F16) && NR_POOL_VECTOR_STORE
 layout(set = 0, binding = 5, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_e4m3x4[]; };
@@ -1957,8 +2160,30 @@ bool nr_mlive[NR_WIN / 16];
     (!NR_HWAVES && defined(NR_FUSED_UPS_PROJECT) && !NR_K_REGS && !NR_ACTIVATION_LUT && !NR_CONTEXT_LDS))
 #error "NR_UPS_ALIAS: head-split wide or one-wave C=32 upsample bodies"
 #endif
+#ifndef NR_UPS_U32
+#define NR_UPS_U32 0
+#endif
 #if (defined(NR_FUSED_UPS_PROJECT) || defined(NR_WIDE_UPS_PROJECT)) && !NR_UPS_ALIAS
+#if NR_UPS_U32
+// Windows (LLPC) NR_UPS_U32: the projected pixels as f16 pairs, so the blend reads a pair with
+// one ds_load_b32 instead of two ds_load_u16; the fragments are stored in u32 units. Same bytes.
+shared uint ups_u32[NR_C*8];
+#else
 shared NR_F16 ups_projected[NR_C*16];
+#endif
+#endif
+#if NR_UPS_U32
+#define NR_UPS_PAIR(pb) unpackFloat2x16(ups_u32[(pb) >> 1u])
+#define NR_UPS_ONE(i) unpackFloat2x16(ups_u32[(i) >> 1u])[(i) & 1u]
+#if NR_UPS_ALIAS
+#define NR_UPS_STORE(frag, off) NR_STORE_ACC_COL(frag, ups_projected, off, 16u)
+#else
+#define NR_UPS_STORE(frag, off) NR_STORE_ACC_COL(frag, ups_u32, (off) / 2u, 8u)
+#endif
+#else
+#define NR_UPS_PAIR(pb) f16vec2(ups_projected[pb], ups_projected[(pb) + 1u])
+#define NR_UPS_ONE(i) ups_projected[i]
+#define NR_UPS_STORE(frag, off) NR_STORE_ACC_COL(frag, ups_projected, off, 16u)
 #endif
 
 // K as [head][token][dim] so the logit product reads it as a plain RowMajor A,
@@ -1996,6 +2221,9 @@ shared NR_F16 ups_projected[NR_C*16];
 #extension GL_EXT_shared_memory_block : require
 shared NrLdsYX { NR_E4M3 lds_y[NR_WIN * NR_C]; NR_E4M3 lds_x[NR_WIN * NR_C]; };
 shared NrUpsProj { NR_F16 ups_projected[NR_C * 16]; };
+#if NR_UPS_U32
+shared NrUpsProjU { uint ups_u32[NR_C * 8]; };   // the same bytes (blocks alias at 0)
+#endif
 #else
 #if NR_PBATCH > 1
 shared NR_E4M3 lds_x[NR_PBATCH * NR_WIN * NR_C];
@@ -2026,6 +2254,9 @@ shared NR_E4M3 nr_act_lds[NR_ACTIVATION_LUT_SIZE];
 #extension GL_EXT_shared_memory_block : require
 shared NrLdsKV { NR_QK_STAGE_T lds_k[NR_WIN * NR_HD]; NR_PV_STAGE_T lds_v[NR_HD * NR_WIN]; };
 shared NrUpsProj { NR_F16 ups_projected[NR_C * 16]; };
+#if NR_UPS_U32
+shared NrUpsProjU { uint ups_u32[NR_C * 8]; };   // the same bytes (blocks alias at 0)
+#endif
 #else
 #if !NR_K_REGS
 // NR_STAGE_T is NR_E4M3, or NR_F16 under NR_F16_MMA - twice the bytes, because
@@ -2075,25 +2306,19 @@ shared uint nr_lds_pad[NR_LDS_PAD / 4];
 // Keeping row selection constant lets the driver combine adjacent reads.
 #define NR_C32_WEIGHT(frag,base,row,k,kf) { \
     const uint q=(base)/4u+((row)/2u)*(kf)*128u+(k)*128u+lane*4u+((row)&1u)*2u; \
-    const fe4m3vec4 lo=wexpand_pair4[q],hi=wexpand_pair4[q+1u]; \
-    for(int z=0;z<4;++z){(frag)[z]=lo[z];(frag)[z+4]=hi[z];} }
+    NR_WPAIR_FILL(frag,q) }
 #else
 #define NR_C32_WEIGHT(frag,base,row,k,kf) \
-    NR_LOAD_A(frag,NR_WARENA,NR_TILE(base,(row)*16u,(k)*16u,(kf)*16u),16u)
+    NR_LOAD_WA(frag,NR_TILE(base,(row)*16u,(k)*16u,(kf)*16u),16u)
 #endif
 
 // Adjacent N fragments share one 16-byte lane read. `row` and `k`
 // count 16-element fragments; each result keeps its original ascending K
 // reduction. The host repacks only weights, before merging persistent runs.
 #if (defined(NR_PACKED_QKV) || NR_PACKED_DENSE) && NR_HWAVES
-#define NR_WEIGHT_PAIR(wf0,wf1,base,row,k,kfrags) { \
+#define NR_WEIGHT_PAIR_S(wf0,wf1,base,row,k,kfrags,bit) { \
     const uint q=(base)/4u + ((row)/2u)*(kfrags)*128u + (k)*128u + lane*4u; \
-    const fe4m3vec4 w0=wexpand_pair4[q],w1=wexpand_pair4[q+1u]; \
-    const fe4m3vec4 w2=wexpand_pair4[q+2u],w3=wexpand_pair4[q+3u]; \
-    for(int v=0;v<4;++v) { \
-        wf0[v]=w0[v]; wf0[v+4]=w1[v]; \
-        wf1[v]=w2[v]; wf1[v+4]=w3[v]; \
-    } }
+    NR_WPAIR_FILL2S(wf0,wf1,q,bit) }
 #endif
 
 // Full FP32 activation arithmetic, no truncated input table.
@@ -2203,8 +2428,14 @@ float nr_act_horner_b(float x) {
 #define nr_mp_cubic_silu_b nr_act_horner
 #endif
 #if NR_ACT_PAT
+#if defined(NR_ABLATE_ACT) && NR_ABLATE_ACT
+// Diagnostic (wrong output): the activation priced by leaving it out.
+#define NR_ACTP(x, c)   (x)
+#define NR_ACTP_B(x, c) (x)
+#else
 #define NR_ACTP(x, c)   nr_act_pick(x, c)
 #define NR_ACTP_B(x, c) nr_act_pick(x, c)
+#endif
 #else
 #define NR_ACTP(x, c)   nr_mp_cubic_silu(x)
 #define NR_ACTP_B(x, c) nr_mp_cubic_silu_b(x)
@@ -2312,6 +2543,9 @@ fe4m3vec2 nr_act_lookup(f16vec2 x) {
 // pq2 * f16vec2(NR_F16(inv)). The same number as the f32 spelling (the product of two f16 values
 // is exact in f32, so rounding it to f16 and the f16 RNE multiply agree - see the note below), which
 // is ACO-shaped; LLPC shrank the f32 form into two scalar v_mul_f16 plus a shift per pair.
+// Windows NR_PROB_PK=2: the normalised probability multiplied in f32 (vec2(p) * inv) and
+// converted to e4m3 from there - one rounding where PROB_PK=1 rounds the f16 product first
+// (NVIDIA's spelling). Changes the picture; measured against Linux / the 5090.
 #ifndef NR_PROB_PK
 #define NR_PROB_PK 1
 #endif
@@ -2855,6 +3089,7 @@ void main() {
             // rather than by fence. See the buffer's own comment for what the
             // ISA says about that.
             barrier();
+            NR_PROF_ITEM_WAITED(pcp.sync_off | 0xC0000000u, nr_item)
         }
 #endif
 #if defined(NR_DIAG_SKIP_EDGE) && NR_PERSIST && NR_PERSIST_DF

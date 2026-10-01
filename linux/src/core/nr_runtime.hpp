@@ -292,6 +292,10 @@ struct EngineFrame {
     // its own history, latch and parity exactly as it would with NVIDIA's DLL,
     // where a feature IS the object that owns them.
     uint64_t feature = 0;
+    // where the answer goes when it is not `colour` itself (same format and
+    // extent, one pass, the model applied). `colour` is then only read, and the
+    // host's seed copy of the colour into the target is not needed.
+    ColourFrame target;
 };
 
 struct EngineResult {
@@ -335,6 +339,9 @@ public:
     // Requires a runtime built with TemporalConfig::enable, whose extent matches
     // the render resolution rather than the display one.
     EngineResult record_engine(VkCommandBuffer, const EngineFrame&, const Controls&);
+    // whether record_engine can take EngineFrame::target with these controls
+    // (the model applied, one pass). A host asks before it skips its own seed copy.
+    bool takes_target(const Controls&) const;
     // Drop a feature's temporal state (EngineFrame::feature). The images are not
     // freed here: the caller's last use of them may still be executing and this
     // is called from a render thread, so they are retired and destroyed a fixed

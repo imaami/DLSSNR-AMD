@@ -40,6 +40,9 @@ PFN_GetDeviceQueue real_get_device_queue = nullptr;
 PFN_GetDeviceQueue2 real_get_device_queue2 = nullptr;
 PFN_EnumeratePhysicalDevices real_enumerate_physical_devices = nullptr;
 
+// What install() hooked, for uninstall().
+std::vector<void*> hooked_targets;
+
 VkResult VKAPI_PTR hooked_create_instance(const VkInstanceCreateInfo* info,
                                           const VkAllocationCallbacks* allocator,
                                           VkInstance* out) {
@@ -133,12 +136,25 @@ bool install() {
     bool all = true;
     for (const auto& entry : entries) {
         void* target = reinterpret_cast<void*>(GetProcAddress(vulkan, entry.name));
-        if (!target || MH_CreateHook(target, entry.detour, entry.original) != MH_OK ||
-            MH_EnableHook(target) != MH_OK)
+        if (!target || MH_CreateHook(target, entry.detour, entry.original) != MH_OK) {
             all = false;
+            continue;
+        }
+        hooked_targets.push_back(target);
+        if (MH_EnableHook(target) != MH_OK) all = false;
     }
     log("[nr] Vulkan device watch %s", all ? "installed" : "incomplete");
     return all;
+}
+
+void uninstall() {
+    if (hooked_targets.empty()) return;
+    for (void* target : hooked_targets) {
+        MH_DisableHook(target);
+        MH_RemoveHook(target);
+    }
+    hooked_targets.clear();
+    log("[nr] Vulkan device watch removed");
 }
 
 DeviceHandles handles() {

@@ -1,11 +1,16 @@
 # DLSSNR-AMD Windows installer (run by install.bat)
 #
 #   install.bat                      a window asks for the game's exe, then for the route
-#   install.bat <game exe or its folder> [optiscaler|reshade|dx9|remove|logs]
+#   install.bat <game exe or its folder> [optiscaler|reshade|dx9|remove|logs] [-Dll <nvngx_dlssnr.dll or its zip>]
+#
+# The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.8.0)
+# or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes dlssnr.bin from it (it only
+# reads the weight data; the DLL is never loaded or run). The model is kept in the package's dlssnr-amd\,
+# so later installs from this package need no DLL.
 #
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
 # overwrite are first moved to dlssnr-amd-backup\, and uninstall deletes ours and puts them back.
-param([string]$Target = '', [string]$Route = '', [switch]$Pause)
+param([string]$Target = '', [string]$Route = '', [string]$Dll = '', [switch]$Pause)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -76,6 +81,7 @@ if ($Route -ne 'logs') {
         if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Fail "Cannot write to $game" }
         Say 'This folder needs administrator rights, asking for them...'
         $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$game`" -Route $Route -Pause"
+        if ($Dll) { $elevated += " -Dll `"$Dll`"" }
         $p = Start-Process powershell -Verb RunAs -ArgumentList $elevated -PassThru -Wait
         exit $p.ExitCode
     }
@@ -194,11 +200,62 @@ if ($Route -eq 'remove') { Remove-Installed; Finish 0 }
 # ---- install ---------------------------------------------------------------------------------
 $bits = Get-ExeBits $exe
 if ($bits -eq 32) { Fail "This is a 32-bit game ($exe); this package supports 64-bit games only." }
-if (-not (Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\dlssnr.bin'))) { Fail 'Incomplete package: dlssnr-amd\dlssnr.bin is missing.' }
+# ---- model -----------------------------------------------------------------------------------
+# The package's dlssnr-amd\dlssnr.bin, or one extracted now from the user's nvngx_dlssnr.dll. Its SHA256
+# has to be the tested model's.
+$ModelSha = '2B41C888CF4155B8958C665BA64018AB0BD25C85FC71A2B6DB86D0D04D1F7FBD'
+$model = Join-Path $here 'dlssnr-amd\dlssnr.bin'
+$modelFrom = $model
+if (-not (Test-Path -LiteralPath $model)) {
+    if (-not $Dll) {
+        Say ''
+        Say 'The package has no model. The first install needs NVIDIA''s nvngx_dlssnr.dll (version 310.8.0), or a zip that contains it.'
+        Say 'Only its weight data is read; it is never loaded or run. The model is kept in this package, so later installs do not ask again.'
+        Add-Type -AssemblyName System.Windows.Forms
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = 'Choose nvngx_dlssnr.dll (310.8.0) or a zip that contains it'
+        $dialog.Filter = 'nvngx_dlssnr.dll or zip (*.dll;*.zip)|*.dll;*.zip'
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { Fail 'No nvngx_dlssnr.dll chosen; cannot install.' }
+        $Dll = $dialog.FileName
+    }
+    $Dll = $Dll.Trim('"')
+    if (-not (Test-Path -LiteralPath $Dll -PathType Leaf)) { Fail "Not found: $Dll" }
+    $work = Join-Path $env:TEMP ("dlssnr-amd-model-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        $src = (Resolve-Path -LiteralPath $Dll).Path
+        if ([System.IO.Path]::GetExtension($src) -ieq '.zip') {
+            Say 'Unpacking the zip ...'
+            Expand-Archive -LiteralPath $src -DestinationPath (Join-Path $work 'zip') -Force
+            $found = @(Get-ChildItem -LiteralPath (Join-Path $work 'zip') -Recurse -File -Filter 'nvngx_dlssnr.dll')
+            if ($found.Count -ne 1) { Fail "The zip should hold exactly one nvngx_dlssnr.dll; found $($found.Count)." }
+            $src = $found[0].FullName
+        }
+        Say 'Extracting the model ...'
+        $tmpModel = Join-Path $work 'dlssnr.bin'
+        & (Join-Path $here 'model-tools\dlssnr_extract_model.exe') $src $tmpModel
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpModel)) { Fail 'Extracting the model failed (see above).' }
+        try {
+            Copy-Item -LiteralPath $tmpModel -Destination $model -Force
+            Say "The model is kept in $model; later installs from this package need no DLL."
+        } catch {
+            # The package folder is not writable: install from the temporary copy; the next install asks again.
+            $modelFrom = Join-Path $env:TEMP 'dlssnr-amd-model.bin'
+            Copy-Item -LiteralPath $tmpModel -Destination $modelFrom -Force
+            Say 'Note: the model could not be kept in the package folder (not writable?); the next install needs the DLL again.'
+        }
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+if ((Get-FileHash -LiteralPath $modelFrom -Algorithm SHA256).Hash -ne $ModelSha) {
+    Fail "$modelFrom is damaged or not this version's model. Delete it and install again with nvngx_dlssnr.dll."
+}
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
 
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
+if ($modelFrom -ne $model) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
 Put-File (Join-Path $here 'vkd3d-proton\d3d12.dll') 'd3d12.dll'
 Put-File (Join-Path $here 'vkd3d-proton\d3d12core.dll') 'd3d12core.dll'
 Put-File (Join-Path $here 'dxvk\d3d11.dll') 'd3d11.dll'
@@ -274,6 +331,6 @@ if ($Route -eq 'optiscaler') {
 } else {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini in the game folder.'
 }
-Say 'The first time in game the network has to compile; it starts after about half a minute.'
+Say 'The first time NR runs in a game the network has to compile; it takes effect after about a minute. This happens once for each game.'
 Say 'Uninstall: run install.bat again and choose 4.'
 Finish 0

@@ -1102,7 +1102,8 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
 
 bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                         ID3D12Resource* output, D3D12_RESOURCE_STATES output_state,
-                        const EngineResources& resources, const Controls& controls) {
+                        const EngineResources& resources, const Controls& controls,
+                        ID3D12Resource* input, D3D12_RESOURCE_STATES input_state) {
     auto& s = *impl_;
     if (s.failed || !device || !list || !output) return false;
     s.status.clear();
@@ -1126,6 +1127,21 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
     EngineFrame engine{};
     engine.colour = frame;
+    // A separate input: the network samples it in place and stores its answer
+    // into the output, so the output needs no copy of the colour first. Only
+    // the engine path with the model applied; anything else is the caller's
+    // seed copy and the in-place run.
+    if (input) {
+        if (!resources.motion || !s.runtime || !s.runtime->takes_target(controls)) return false;
+        const auto source = colour_handle(device, input, input_state);
+        if (!source.usable() || source.format != target.format || source.width != target.width ||
+            source.height != target.height || !(source.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+            return false;
+        engine.target = frame;
+        engine.colour.image = source.image;
+        engine.colour.before = engine.colour.after = source.layout;
+        engine.colour.usage = source.usage;
+    }
     engine.feature = resources.feature;
     engine.reset = resources.reset;
     engine.motion_scale_x = resources.motion_scale_x;
@@ -1140,6 +1156,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (resources.depth &&
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
         apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
+    if (input && !motion_vk) return false;   // the plain path works in place: the caller seeds
     // Full memory barriers on either side of the network, because the caller's
     // barriers are vkd3d's translation of D3D12 resource states and know
     // nothing about ours. Its "UAV -> SRV" on the output waits for compute
@@ -1483,6 +1500,21 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
 
     EngineFrame engine{};
     engine.colour = colour;
+    // The caller's colour read in place and its output written directly (the engine path with
+    // the model applied): the copy into vk_output, the copy into the runtime's input and the
+    // write-back all go. Anything else keeps the copies below.
+    const bool direct = frame.output && frame.motion && s.runtime && s.runtime->takes_target(controls) &&
+                        (frame.colour_usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+                        !(std::getenv("NR_VK_COPY") && std::atoi(std::getenv("NR_VK_COPY")));
+    if (direct) {
+        engine.colour.image = frame.colour;
+        engine.colour.before = engine.colour.after = frame.colour_layout;
+        engine.colour.usage = frame.colour_usage;
+        engine.target = colour;
+        engine.target.image = frame.output;
+        engine.target.before = engine.target.after = frame.output_layout;
+        engine.target.usage = frame.output_usage;
+    }
     engine.feature = frame.feature;
     engine.reset = frame.reset;
     engine.motion_scale_x = frame.motion_scale_x;
@@ -1506,6 +1538,17 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         apply_guide_subrect(&engine.depth, frame.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     }
 
+    if (direct) {
+        try {
+            s.runtime->record_engine(cmd, engine, controls);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return frame.output;
+    }
     try {
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

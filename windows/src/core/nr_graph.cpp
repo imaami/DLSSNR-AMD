@@ -1447,6 +1447,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // and its comment carries the sweep that chose it.
     // **32, was 16**; moving one of these three without the other two
     // is a kernel that computes a fraction of the sequence and is fast for it.
+    // Windows, measured 10-01: NR_QT=16 (71 VGPRs under LLPC against 114) makes vitattn 1080p
+    // -0.009 ms but the ViT projection that reads its output +0.124: kept at 32.
     const uint32_t vattn_qt =
         uint32_t(std::atoi(arg(argc, argv, "--vattn-qt", "32")));
 
@@ -3226,10 +3228,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 uint32_t wgo = wg_override;
                 // Diagnostic: per-width override NR_PERSIST_WG_<C>.
                 if (const char* e = std::getenv(("NR_PERSIST_WG_" + std::to_string(C)).c_str())) wgo = uint32_t(std::atoi(e));
-                // C=64 runs of up to 4096 windows a layer take 384 workgroups, six
-                // a CU instead of eight: fewer starved young ones (1080p -5 us a
-                // run; at 4K, 8 of them a CU are faster by 10).
-                if (!wgo && C == 64 && most <= 4096u) wgo = 384u;
+                // C=64 runs used to take 384 workgroups (six a CU) up to 4096
+                // windows a layer. The cap is faster at every such extent: Linux
+                // 1080p -0.012 ms (with the tile counters), Windows 1080p pds64
+                // 0.461 -> 0.432 and pup64 0.445 -> 0.419 ms, 4K tie; byte-identical.
                 uint32_t wg = std::min(most, wgo ? wgo : cap);
                 // One workgroup per item: a persistent workgroup keeps its launch
                 // age for the whole run, and oldest-first wave arbitration runs the

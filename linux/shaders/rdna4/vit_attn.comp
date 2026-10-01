@@ -34,12 +34,21 @@ layout(set = 0, binding = 1, std430) readonly buffer WgtF32  { float   wgt_f32[]
 #ifndef NR_VOUT_VEC
 #define NR_VOUT_VEC 0
 #endif
+#ifndef NR_VOUT_PAIR
+#define NR_VOUT_PAIR 0
+#endif
 #if NR_VOUT_VEC
 layout(set = 0, binding = 2, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
 #else
 layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
 #endif
 
+#ifndef NR_TC_ALLWAIT
+#define NR_TC_ALLWAIT 0
+#endif
+#if NR_TC_ALLWAIT
+#extension GL_KHR_shader_subgroup_vote : require
+#endif
 #define NR_TC_WBIND 1   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
 layout(push_constant) uniform Push {
@@ -361,6 +370,29 @@ void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
     NR_TC_PROLOGUE
+#if NR_TCHAIN && NR_TC_ALLWAIT
+    // the QKV -> attention link through tile counters (host kind 256). Attention needs
+    // every token's K and V, so this workgroup waits for all of the producer's token tiles -
+    // the lanes each poll their own tiles, so a ready producer costs one round trip, not one
+    // a tile. Launched right behind the QKV (no barrier), the wait replaces the drain + ramp.
+    if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 2u] != 0xFFFFFFFFu) {
+        const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u];
+        const uint nr_te = subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 0u));
+        const uint nr_nt = (pc.tokens + 15u) / 16u;
+        uint nr_tb = NR_TCHAIN_BOUND;
+        bool nr_ok;
+        do {
+            nr_ok = true;
+            for (uint nr_t = gl_LocalInvocationID.x; nr_t < nr_nt; nr_t += gl_SubgroupSize) {
+                const uint nr_tx = nr_tc_w[nr_ttb + nr_t];
+                if (nr_tx != 0xFFFFFFFFu &&
+                    atomicAdd(nr_tc_u[nr_twt + (nr_tx & 0xFFFFFu)], 0u) < (nr_tx >> 20u) * nr_te) nr_ok = false;
+            }
+        } while (!subgroupAll(nr_ok) && --nr_tb != 0u);
+        if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_w[nr_tc_rec + 5u]], 1u);
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
+    }
+#endif
     const uint q0 = gl_WorkGroupID.x * uint(NR_QT);
     const uint head = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
@@ -505,8 +537,21 @@ void main() {
         {
             for (uint n = 0u; n < 2u; ++n) {
                 NR_E4M3 qv[8];
+#if NR_VOUT_PAIR
+#if NR_QUANT_MODE != 1
+#error "NR_VOUT_PAIR spells quant mode 1's f16 clamp"
+#endif
+                // the same f16 products and clamp, two at a time (v_pk_mul_f16,
+                // v_pk_max/min_f16); each element rounds exactly as the scalar form.
+                for (int c = 0; c < 8; c += 2) {
+                    const f16vec2 p = f16vec2(NR_F16(ctx[b][n][c]), NR_F16(ctx[b][n][c + 1])) * f16vec2(inv);
+                    const fe4m3vec2 e = fe4m3vec2(clamp(p, f16vec2(-448.0hf), f16vec2(448.0hf)));
+                    qv[c] = e.x; qv[c + 1] = e.y;
+                }
+#else
                 for (int c = 0; c < 8; ++c)
                     qv[c] = nr_quant_e4m3(NR_F16(NR_F16(ctx[b][n][c]) * inv));
+#endif
                 const uint o4 = nr_at(pc.o_off, q, qbase + n * 16u + row0, uint(NR_C)) >> 2;
                 act_x4[o4] = fe4m3vec4(qv[0], qv[1], qv[2], qv[3]);
                 act_x4[o4 + 1u] = fe4m3vec4(qv[4], qv[5], qv[6], qv[7]);

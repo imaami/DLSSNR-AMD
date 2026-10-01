@@ -298,6 +298,12 @@
 #ifndef NR_GEMM_REMAP_PC
 #define NR_GEMM_REMAP_PC 0
 #endif
+#ifndef NR_TC_WG_SIGNAL
+#define NR_TC_WG_SIGNAL 0
+#endif
+#if NR_TC_WG_SIGNAL && NR_WM != 1
+#error "NR_TC_WG_SIGNAL: one wave row a workgroup (NR_WM == 1)"
+#endif
 #ifndef NR_ABLATE_STAGE
 #define NR_ABLATE_STAGE 0       // 1: stage constants, no global load
 #endif
@@ -807,6 +813,12 @@ void nr_finish_tile(uint tok0, uint ch0, uint wave, uint lane) {   // NOLINT
 #ifndef NR_OUT_PERM
 #define NR_OUT_PERM 0
 #endif
+#ifndef NR_OUT_KPAIR
+#define NR_OUT_KPAIR 0
+#endif
+#if NR_OUT_KPAIR && (NR_SWAP_AB || NR_OUT_PERM || NR_POOL_FRAG || !defined(NR_OUT_TILED))
+#error "NR_OUT_KPAIR: the unswapped tiled e4m3 fragment epilogue"
+#endif
 // NR_POOL_FRAG: gemmpool on the fragment epilogue. The 2x2 block whose
 // top-left token row is r reads rows r, r+1, r+4, r+5 - components c0, c0+1,
 // c0+4, c0+5 (c0 = 0, 2) of the lane holding rows row0..row0+7 - so the pool
@@ -881,10 +893,19 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
 #endif
 }
 #else
+#ifndef NR_EPI_LANEBYTE
+#define NR_EPI_LANEBYTE 0
+#endif
 void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
     if (tok0 >= pc.M) return;
     uint col = lane % 16u, row0 = 8u * (lane / 16u);
     uint tile = ((tok0 / 16u) * (pc.N / 16u) + ch0 / 16u) * 256u;
+#if NR_EPI_LANEBYTE
+    // element c of the lane's column is byte (row0 + c)*16 + col of the tile. The lane
+    // term first, the constant 16c last, so the eight loads/stores share one address and carry
+    // 16c in the instruction's offset field (the old tree added it in the middle: 2 VALU each).
+    const uint nr_lb = ((lane & 16u) << 3u) | (lane & 15u);
+#endif
 #ifndef NR_NO_RESIDUAL
     NR_F16 g = wgt_f16[pc.g_off + ch0 + col];
 #endif
@@ -906,8 +927,12 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
         // `raw` back from was an identity round trip on an f32.
         NR_F16 v = NR_F16(NR_ACT_APPLY(raw));
 #else
+#if NR_EPI_LANEBYTE
+        NR_F16 r = NR_F16(act_e4m3[(pc.r_off + tile + nr_lb) + uint(c) * 16u]);
+#else
         NR_F16 r = NR_F16(act_e4m3[pc.r_off + tile +
                                   (row0 + uint(c)) * 16u + col]);
+#endif
 #ifdef NR_EPILOGUE_NVIDIA
         float gr = nr_round_f16(float(g) * float(r));
         NR_F16 v = NR_F16(nr_round_f16(raw) + gr);
@@ -980,6 +1005,17 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
     }
 #endif
 #if defined(NR_OUT_E4M3) && NR_OUT_PERM == 1
+#elif defined(NR_OUT_E4M3) && NR_OUT_KPAIR
+    // NR_OUT_KPAIR: element (t, c) of the tile goes to record
+    // ((tok0/16)*(N/32) + ch0/32)*512 at (t + 16*(c/8))*16 + ((ch0/16)&1)*8 + c%8
+    // (the consumer's NR_A_KPAIR layout). A lane owns column `col`, rows row0..+7.
+    {
+        const uint kpb = pc.o_off + ((tok0 / 16u) * (pc.N / 32u) + ch0 / 32u) * 512u
+                       + ((ch0 / 16u) & 1u) * 8u + (col >> 3u) * 256u + (col & 7u);
+        for (int c = 0; c < 8; ++c) act_e4m3[kpb + (row0 + uint(c)) * 16u] = result[c];
+    }
+#elif defined(NR_OUT_E4M3) && NR_EPI_LANEBYTE && !NR_OUT_PERM
+    for (int c = 0; c < 8; ++c) act_e4m3[(pc.o_off + tile + nr_lb) + uint(c) * 16u] = result[c];
 #elif defined(NR_OUT_E4M3)
     NR_STORE_ACC(result, act_e4m3, pc.o_off + tile, 16u);
 #elif defined(NR_OUT_TILED)
@@ -1117,7 +1153,17 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 #define NR_KOFF_SPLIT 0
 #endif
 #if NR_KOFF_SPLIT && NR_ABLATE_ADDR == 0
+#ifndef NR_DIAG_BFOLDG
+#define NR_DIAG_BFOLDG 0
+#endif
+#if NR_DIAG_BFOLDG
+// diagnostic (wrong picture): every packed B (weight) read of the dispatch
+// inside the matrix's first NR_DIAG_BFOLDG u32 words - same loads, B data still
+// real weights (B values do not move WMMA power, ), L2/DRAM traffic ~gone.
+#define NR_BADDR(j) ((pc.w_off / 4u) + ((((bbase_g[j] + bkc) + NR_BKOFF(kknext)) - pc.w_off / 4u) & uint(NR_DIAG_BFOLDG - 1)))
+#else
 #define NR_BADDR(j) ((bbase_g[j] + bkc) + NR_BKOFF(kknext))
+#endif
 #else
 #undef NR_KOFF_SPLIT
 #define NR_KOFF_SPLIT 0
@@ -1181,6 +1227,85 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 #endif
 #define NR_LOADS     NR_FOR_I(NR_MFRAG, NR_LDA_I) NR_FOR_J(NR_NFRAG, NR_LDB_J)
 
+// NR_A_LDSV: with NR_WM = 1 every wave of a workgroup multiplies the same A
+// (token) fragments, and each loaded them itself (buffer_load_b64, ~4 SIMD
+// cycles of write-back each, ). Here the workgroup copies a chunk's A tiles
+// once - 16-byte loads spread over its threads - into a double-buffered LDS
+// copy, and the waves read their fragments with ds_load_b64 (~1.6 cycles).
+// Same bytes, same fragments, same k order: byte-identical. One barrier a chunk.
+#ifndef NR_A_LDSV
+#define NR_A_LDSV 0
+#endif
+#if NR_A_LDSV
+#if !(NR_KOFF_SPLIT && defined(NR_TILED_A) && defined(NR_A_DIRECT) && !defined(NR_OPERAND_F16)) || NR_WM != 1 \
+    || NR_XPIPE || NR_STAGED || NR_SWAP_AB || NR_ABLATE_LOADS || NR_KPAIR_ABL
+#error "NR_A_LDSV: tile-blocked e4m3 A, direct loads, NR_WM = 1, no XPIPE/staging/swap/ablation"
+#endif
+#define NR_LDSV_V4 (NR_MFRAG * NR_KFRAG * 64)          // fe4m3vec4 a chunk (256 B a tile)
+#define NR_LDSV_U (NR_MFRAG * NR_KFRAG * 16 / NR_THREADS) // 16-byte units a thread
+#if NR_LDSV_U < 1 || NR_LDSV_U * NR_THREADS != NR_MFRAG * NR_KFRAG * 16
+#error "NR_A_LDSV: the chunk's 16-byte units must divide over the workgroup"
+#endif
+shared fe4m3vec4 lds_av[2 * NR_LDSV_V4];
+#undef NR_LDA_I
+#define NR_LDA_I(i) { \
+    const uint nrq = lbuf + (uint(i) * uint(NR_KFRAG) + kknext / 16u) * 64u + ldsv_lane4; \
+    const fe4m3vec4 r0 = lds_av[nrq], r1 = lds_av[nrq + 1u]; \
+    for (int v = 0; v < 4; ++v) { fa[cur][i][v] = r0[v]; fa[cur][i][v + 4] = r1[v]; } }
+// unit u = tile t (= i * NR_KFRAG + kt) * 16 + e; tile (i, kt) is 256 contiguous
+// bytes at token tile mg0/16 + i, k tile k0/16 + kt of the tile-blocked arena.
+#define NR_LDSV_FETCH(kc0) \
+    for (int q = 0; q < NR_LDSV_U; ++q) { \
+        const uint u = tid + uint(q) * uint(NR_THREADS), t = u / 16u, e = u % 16u; \
+        const uint g = (pc.x_off / 4u) + ((mg0 / 16u + t / uint(NR_KFRAG)) * (pc.K / 16u) \
+                     + (kc0) / 16u + t % uint(NR_KFRAG)) * 64u + e * 4u; \
+        for (int v = 0; v < 4; ++v) ldsv_r[q][v] = act_e4m3x4[g + uint(v)]; }
+#define NR_LDSV_SPILL(b0) \
+    for (int q = 0; q < NR_LDSV_U; ++q) { \
+        const uint u = tid + uint(q) * uint(NR_THREADS); \
+        for (int v = 0; v < 4; ++v) lds_av[(b0) + u * 4u + uint(v)] = ldsv_r[q][v]; }
+#endif
+
+// NR_B_LDSV: with NR_WM > 1 the NR_WM waves of a workgroup that share an
+// N range read the same packed weight records. The workgroup copies a chunk's
+// records once (16-byte loads over its threads) into a double-buffered LDS
+// copy; the waves read fragment pairs from it. L2 weight traffic / NR_WM, same
+// bytes and k order: byte-identical. One barrier a chunk (shared with A_LDSV).
+#ifndef NR_B_LDSV
+#define NR_B_LDSV 0
+#endif
+#if NR_B_LDSV
+#if !(NR_KOFF_SPLIT && defined(NR_PACKED_WEIGHT_N2) && defined(NR_B_DIRECT)) || NR_WM < 2 || NR_XPIPE || NR_STAGED \
+    || NR_SWAP_AB || NR_ABLATE_LOADS || (NR_NFRAG % 2) || NR_DIAG_BFOLDG
+#error "NR_B_LDSV: N-pair packed weights, direct loads, NR_WM >= 2"
+#endif
+#define NR_BLDSV_V4 ((NR_NTILE / 32) * NR_KFRAG * 128)          // fe4m3vec4 a chunk (512 B a record)
+#define NR_BLDSV_U ((NR_NTILE / 32) * NR_KFRAG * 32 / NR_THREADS) // 16-byte units a thread
+#if NR_BLDSV_U < 1 || NR_BLDSV_U * NR_THREADS != (NR_NTILE / 32) * NR_KFRAG * 32
+#error "NR_B_LDSV: the chunk's 16-byte units must divide over the workgroup"
+#endif
+shared fe4m3vec4 lds_bv[2 * NR_BLDSV_V4];
+#undef NR_LDB_J
+#define NR_LDB_J(j) if (((j)&1)==0) { \
+    const uint nrq = blbuf + ((nloc / 32u + uint(j) / 2u) * uint(NR_KFRAG) + kknext / 16u) * 128u + lane * 4u; \
+    const fe4m3vec4 w0=lds_bv[nrq],w1=lds_bv[nrq+1u],w2=lds_bv[nrq+2u],w3=lds_bv[nrq+3u]; \
+    for(int v=0;v<4;++v) { \
+        fb[cur][j][v]=w0[v]; fb[cur][j][v+4]=w1[v]; \
+        fb[cur][((j)+1)%NR_NFRAG][v]=w2[v]; fb[cur][((j)+1)%NR_NFRAG][v+4]=w3[v]; \
+    } }
+// unit u = record r (= pl * NR_KFRAG + kt) * 32 + e: record (pair ng0/32 + pl, k tile k0/16 + kt)
+#define NR_BLDSV_FETCH(kc0) \
+    for (int q = 0; q < NR_BLDSV_U; ++q) { \
+        const uint u = tid + uint(q) * uint(NR_THREADS), r = u / 32u, e = u % 32u; \
+        const uint g = (pc.w_off / 4u) + ((ng0 / 32u + r / uint(NR_KFRAG)) * (pc.K / 16u) \
+                     + (kc0) / 16u + r % uint(NR_KFRAG)) * 128u + e * 4u; \
+        for (int v = 0; v < 4; ++v) bldsv_r[q][v] = wgt_pair4[g + uint(v)]; }
+#define NR_BLDSV_SPILL(b0) \
+    for (int q = 0; q < NR_BLDSV_U; ++q) { \
+        const uint u = tid + uint(q) * uint(NR_THREADS); \
+        for (int v = 0; v < 4; ++v) lds_bv[(b0) + u * 4u + uint(v)] = bldsv_r[q][v]; }
+#endif
+
 #if NR_SWAP_AB == 2
 // Swapped and loop-transposed: NR_MMA_I(x) runs weight fragment x against every
 // token fragment, so the A operand stays fixed across the inner loop.
@@ -1230,6 +1355,62 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 // instead of stopping. It measured worse on every configuration on an idle GPU
 // - the select on the address and the extra loads in flight cost more than the
 // stall it removed - and is not kept.
+#ifndef NR_DIAG_APAIR
+#define NR_DIAG_APAIR 0
+#endif
+#if NR_DIAG_APAIR
+// timing diagnostic (wrong values): the A-operand instruction profile of a
+// K-pair A layout - one 16-byte load a fragment on even k steps, none on odd
+// steps, whose MMAs reuse the even step's bank.
+#if !(NR_KOFF_SPLIT && defined(NR_TILED_A) && defined(NR_A_DIRECT)) || (NR_KFRAG % 2) || NR_A_LDSV || NR_XPIPE
+#error "NR_DIAG_APAIR: direct tile-blocked A, even NR_KFRAG"
+#endif
+#undef NR_LDA_I
+#define NR_LDA_I(i) if (((kknext / 16u) & 1u) == 0u) { \
+    const uint nrq = (alane4[i] + akc4) + NR_AKOFF(kknext) / 4u; \
+    const fe4m3vec4 r0 = act_e4m3x4[nrq], r1 = act_e4m3x4[nrq + 1u], r2 = act_e4m3x4[nrq + 2u], r3 = act_e4m3x4[nrq + 3u]; \
+    const int cur2 = (cur + 1) % NR_PIPE; \
+    for (int v = 0; v < 4; ++v) { fa[cur][i][v] = r0[v]; fa[cur][i][v + 4] = r1[v]; \
+                                  fa[cur2][i][v] = r2[v]; fa[cur2][i][v + 4] = r3[v]; } }
+#endif
+// NR_A_KPAIR: A (tokens) stored K-pair interleaved by its producer
+// (NR_OUT_KPAIR): 512-byte records of two 16-channel tiles, lane l's 16 bytes
+// = [tile 2p: row l%16, k 8(l/16)..+7][tile 2p+1: the same]. An even k step
+// loads both steps' fragments with one 16-byte load; the odd step's half goes
+// to its bank after this step's MMAs (that bank is this step's until then).
+// Record and chunk offsets equal the tile layout's; only the lane term moves.
+#ifndef NR_A_KPAIR
+#define NR_A_KPAIR 0
+#endif
+#if NR_A_KPAIR
+#if !(NR_KOFF_SPLIT && defined(NR_TILED_A) && defined(NR_A_DIRECT) && !defined(NR_OPERAND_F16)) || (NR_KFRAG % 2) \
+    || NR_PIPE < 2 || NR_A_LDSV || NR_XPIPE || NR_STAGED || NR_SWAP_AB || NR_ABLATE_LOADS || NR_KPAIR_ABL || NR_DIAG_APAIR
+#error "NR_A_KPAIR: direct tile-blocked e4m3 A, even NR_KFRAG, plain pipeline"
+#endif
+#undef NR_LDA_I
+#define NR_LDA_I(i) if (((kknext / 16u) & 1u) == 0u) { \
+    const uint nrq = (alane4[i] + akc4) + NR_AKOFF(kknext) / 4u; \
+    const fe4m3vec4 r0 = act_e4m3x4[nrq], r1 = act_e4m3x4[nrq + 1u], r2 = act_e4m3x4[nrq + 2u], r3 = act_e4m3x4[nrq + 3u]; \
+    for (int v = 0; v < 4; ++v) { fa[cur][i][v] = r0[v]; fa[cur][i][v + 4] = r1[v]; \
+                                  kpa_hi[i][v] = r2[v]; kpa_hi[i][v + 4] = r3[v]; } }
+#define NR_KPA_DECL NR_FRAG_A kpa_hi[NR_MFRAG];
+#define NR_KPA_PUT(bank) for (int i = 0; i < NR_MFRAG; ++i) fa[bank][i] = kpa_hi[i];
+#else
+#define NR_KPA_DECL
+#endif
+#if NR_A_KPAIR
+#define NR_KSTEP(kf) { \
+        const int pp = (kf) % NR_PIPE; \
+        const int cur = ((kf) + NR_PIPE - 1) % NR_PIPE; \
+        const uint kknext = uint(((kf) + NR_PIPE - 1) * 16); \
+        const uint kglob = (NR_ABLATE_ADDR == 1) ? 0u : (k0 + kknext); \
+        NR_KPA_DECL \
+        if ((kf) + NR_PIPE - 1 < NR_KFRAG) { NR_LOADS } \
+        NR_FOR_I(NR_MFRAG, NR_MMA_I) \
+        if ((kf) + NR_PIPE - 1 < NR_KFRAG && (((kf) + NR_PIPE - 1) & 1) == 0) { NR_KPA_PUT(pp) } \
+        NR_ROUND_STEP(kf) \
+    }
+#else
 #define NR_KSTEP(kf) { \
         const int pp = (kf) % NR_PIPE; \
         const int cur = ((kf) + NR_PIPE - 1) % NR_PIPE; \
@@ -1239,6 +1420,7 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
         NR_FOR_I(NR_MFRAG, NR_MMA_I) \
         NR_ROUND_STEP(kf) \
     }
+#endif
 // Prime banks 0 .. NR_PIPE-2 with steps 0 .. NR_PIPE-2. The guard is a constant
 // so the steps beyond the pipe depth fold away.
 // The index is taken modulo the pipe depth even though the guard already
@@ -1269,6 +1451,15 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
         const uint kglob = k0 + kknext; \
         if ((kf) == 0) { NR_FOR_I(NR_MFRAG, NR_KPA_I) } \
         NR_FOR_J(NR_NFRAG, NR_LDB_J) \
+    }
+#elif NR_A_KPAIR
+#define NR_PRIME(kf) if ((kf) < NR_PRIME_N) { \
+        const int cur = (kf) % NR_PIPE; \
+        const uint kknext = uint((kf) * 16); \
+        const uint kglob = k0 + kknext; \
+        NR_KPA_DECL \
+        NR_LOADS \
+        if (((kf) & 1) == 0) { NR_KPA_PUT(((kf) + 1) % NR_PIPE) } \
     }
 #else
 #define NR_PRIME(kf) if ((kf) < NR_PRIME_N) { \
@@ -1443,8 +1634,17 @@ void main() {
     const uint tid  = gl_LocalInvocationID.x;
     const uint wave = NR_WAVE_OF(tid);
     const uint lane = tid % 32u;
+#ifndef NR_WAVE_MFIRST
+#define NR_WAVE_MFIRST 0
+#endif
+#if NR_WAVE_MFIRST
+    // waves that share an N range (the same weights) are adjacent: w = n * NR_WM + m
+    const uint mloc = (wave % uint(NR_WM)) * uint(NR_MFRAG * 16);
+    const uint nloc = (wave / uint(NR_WM)) * uint(NR_NFRAG * 16);
+#else
     const uint mloc = (wave / uint(NR_WN)) * uint(NR_MFRAG * 16);
     const uint nloc = (wave % uint(NR_WN)) * uint(NR_NFRAG * 16);
+#endif
 #if NR_GEMM_REMAP_PC
     // Workgroup order from the host (pc.remap = G): G M tiles are consecutive
     // workgroups, then every N tile, then the next G M tiles; 0 is the launch
@@ -1467,6 +1667,7 @@ void main() {
 #endif
     const uint nchunk = pc.K / uint(NR_KCHUNK);
     nr_tchain_wait(mg0 / 16u, NR_MTILE / 16)   // NR_TCHAIN: the M tile's token tiles
+    NR_PROF_ITEM_START()   // the wave's work starts here (after the tile-counter wait)
 
 #if defined(NR_A_DIRECT) || defined(NR_B_DIRECT)
     uint abase_g[NR_MFRAG];
@@ -1476,7 +1677,11 @@ void main() {
 #if NR_KOFF_SPLIT && defined(NR_TILED_A) && !defined(NR_OPERAND_F16)
     uint alane4[NR_MFRAG];
     for (int i = 0; i < NR_MFRAG; ++i)
+#if NR_A_KPAIR
+        alane4[i] = (abase_g[i] + lane * 16u) / 4u;
+#else
         alane4[i] = (abase_g[i] + (lane & 15u) * 16u + (lane >> 4u) * 8u) / 4u;
+#endif
 #endif
 #endif
     NR_FRAG_ACC acc[NR_MFRAG][NR_NFRAG];
@@ -1515,11 +1720,33 @@ void main() {
         NR_FOR_K(NR_KFRAG, NR_XKSTEP)
     }
 #else
+#if NR_A_LDSV
+    const uint ldsv_lane4 = (lane & 15u) * 4u + (lane >> 4u) * 2u;
+    fe4m3vec4 ldsv_r[NR_LDSV_U][4];
+    NR_LDSV_FETCH(0u)
+    NR_LDSV_SPILL(0u)
+#endif
+#if NR_B_LDSV
+    fe4m3vec4 bldsv_r[NR_BLDSV_U][4];
+    NR_BLDSV_FETCH(0u)
+    NR_BLDSV_SPILL(0u)
+#endif
+#if NR_A_LDSV || NR_B_LDSV
+    barrier();
+#endif
     for (uint c = 0u; c < nchunk; ++c) {
         const uint k0 = c * uint(NR_KCHUNK);
 #if NR_KOFF_SPLIT
         const uint akc = NR_AKOFF(k0), bkc = NR_BKOFF(k0);
         const uint akc4 = akc / 4u;
+#endif
+#if NR_A_LDSV
+        const uint lbuf = (c & 1u) * uint(NR_LDSV_V4);
+        if (c + 1u < nchunk) { NR_LDSV_FETCH(k0 + uint(NR_KCHUNK)) }
+#endif
+#if NR_B_LDSV
+        const uint blbuf = (c & 1u) * uint(NR_BLDSV_V4);
+        if (c + 1u < nchunk) { NR_BLDSV_FETCH(k0 + uint(NR_KCHUNK)) }
 #endif
 #if NR_STAGED
         // Issue the next chunk's global loads before this chunk's MMAs. Their
@@ -1534,6 +1761,15 @@ void main() {
         const uint bbase = (c % uint(NR_DBUF)) * uint(NR_NTILE * NR_KCHUNK);
         if (NR_ABLATE_LOADS == 0 || c == 0u) { NR_FOR_K(NR_KFRAG, NR_PRIME) }
         NR_FOR_K(NR_KFRAG, NR_KSTEP)
+#if NR_A_LDSV
+        if (c + 1u < nchunk) { NR_LDSV_SPILL(((c + 1u) & 1u) * uint(NR_LDSV_V4)) }
+#endif
+#if NR_B_LDSV
+        if (c + 1u < nchunk) { NR_BLDSV_SPILL(((c + 1u) & 1u) * uint(NR_BLDSV_V4)) }
+#endif
+#if NR_A_LDSV || NR_B_LDSV
+        barrier();
+#endif
 
 #if NR_STAGED
         if (c + 1u < nchunk) {
@@ -1561,6 +1797,20 @@ void main() {
 #endif
     NR_OCC_USE(pc.K == 0u, act_f32[0] = 0.0)
     nr_chain_signal()
+#if NR_TC_WG_SIGNAL
+    // one increment a token tile a workgroup instead of one a wave - with
+    // NR_WM == 1 every wave finishes the same token span. The host then needs gy, not gy*WN
+    // (it keys on the SPV directory's tc_wgsig marker). Same release pattern as nr_tchain_signal.
+    if (nr_tc_sig != 0xFFFFFFFFu) {
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        barrier();
+        if (gl_LocalInvocationIndex < uint(NR_MFRAG))
+            atomicAdd(nr_tc_u[nr_tc_sig + mg0 / 16u + gl_LocalInvocationIndex], 1u, gl_ScopeDevice,
+                      gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+    }
+#else
     nr_tchain_signal_wave((mg0 + mloc) / 16u, NR_MFRAG)
+#endif
+    NR_PROF_ITEM_END(pc.o_off | 0x80000000u, 0u)
     NR_PROF_END(pc.o_off)
 }

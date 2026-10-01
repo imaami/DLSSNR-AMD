@@ -24,6 +24,9 @@
 #if NR_FWAVES > 2 || NR_C != 32 || NR_ACC_F16 != 0 || !defined(NR_INPUT_F16) || !defined(NR_POOL_F16)
 #error Fused image input requires the FP32 one- or two-wave C32 pre pooling kernel
 #endif
+#ifndef NR_TEMPORAL_HPASS
+#define NR_TEMPORAL_HPASS 0
+#endif
 #ifdef NR_EXTERNAL_CONTROL_MASK
 #define NR_MASK_BINDING 6
 #define NR_MASK_SAMPLER_BINDING 8
@@ -48,6 +51,13 @@ layout(set=0,binding=7) uniform sampler2D nr_tex;
 layout(set=0,binding=8) uniform sampler2D nr_motion;
 layout(set=0,binding=9) uniform sampler2D nr_history;
 layout(set=0,binding=10) uniform sampler2D nr_depth;
+#if NR_TEMPORAL_HPASS
+// the post block's history, reconstructed here once. The post samples the
+// history at the pixel's own vector; this block samples it at the depth-chosen
+// tap's, which is the pixel's own everywhere but at silhouettes - there it
+// reconstructs the post's a second time. The post loads the f32 value back.
+layout(set=0,binding=11,rgba32f) uniform writeonly image2D nr_hpass;
+#endif
 #include "temporal_history.glsl"
 #else
 layout(set=0,binding=6) uniform sampler2D nr_tex;
@@ -112,6 +122,9 @@ void nr_prepare_features() {
         // silhouette that is what stops the background's vector being used for
         // a foreground pixel.
         vec2 muv = uv;
+#if NR_TEMPORAL_HPASS
+        bool moved = false;
+#endif
         if (nr_temporal[1].z != 0.0) {
             const vec2 step = 1.0/vec2(sw,sh);
             const bool inverted = nr_temporal[1].w != 0.0;
@@ -119,7 +132,11 @@ void nr_prepare_features() {
             for (int dy=-1; dy<=1; dy+=2) for (int dx=-1; dx<=1; dx+=2) {
                 const vec2 at = uv+vec2(dx,dy)*step;
                 const float d = textureLod(nr_depth,at,0.0).x;
+#if NR_TEMPORAL_HPASS
+                if (inverted ? d>best : d<best) { best=d; muv=at; moved=true; }
+#else
                 if (inverted ? d>best : d<best) { best=d; muv=at; }
+#endif
             }
         }
         // The game's vectors in place at full resolution (the region's share of
@@ -128,6 +145,14 @@ void nr_prepare_features() {
         const vec2 extent = nr_temporal[1].xy;
         const vec3 hist = nr_history_5tap(nr_history,(uv+mv)*extent,vec2(0.5),
                                           extent-0.5,1.0/extent);
+#if NR_TEMPORAL_HPASS
+        vec3 hpost = hist;
+        if (moved) {
+            const vec2 mv0 = textureLod(nr_motion,uv*nr_temporal[2].xy+nr_temporal[2].zw,0.0).xy*nr_temporal[0].yz;
+            hpost = nr_history_5tap(nr_history,(uv+mv0)*extent,vec2(0.5),extent-0.5,1.0/extent);
+        }
+        if (x < sw && y < sh) imageStore(nr_hpass, ivec2(x, y), vec4(hpost, 0.0));
+#endif
         const f16vec3 hcentered = f16vec3(f16vec3(hist)-f16vec3(0.5));
         const vec3 hn = vec3(f16vec3(hcentered*NR_F16(0.125)));
         f[7]=hn.x;f[8]=hn.y;f[9]=hn.z;

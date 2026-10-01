@@ -982,18 +982,21 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
 
     // Seed: output := color. The states are the ones DlssNr_Dx12.cpp holds across the call.
+    // Only when the network does not write the output from the colour itself (see below).
     const D3D12_RESOURCE_STATES kColorState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES kOutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    barrier(cmd, color, kColorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    barrier(cmd, output, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
-    cmd->CopyResource(output, color);
-    barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, kColorState);
-    barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
+    const auto seed = [&] {
+        barrier(cmd, color, kColorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd, output, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
+        cmd->CopyResource(output, color);
+        barrier(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, kColorState);
+        barrier(cmd, output, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
+    };
 
-    // (a) the model's input: the output as the seed left it, which is the colour byte for byte.
+    // (a) the model's input: the colour (what the seed would put in the output, byte for byte).
     bool readback_recorded = false;
     if (readback_sample && readback_ensure(device, *f->debug, output)) {
-        readback_record(cmd, *f->debug, output, kOutputState, f->debug->in);
+        readback_record(cmd, *f->debug, color, kColorState, f->debug->in);
         readback_recorded = true;
     }
 
@@ -1056,8 +1059,27 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     for (const Feature* o : g_live_d3d12)
         if (o->id < f->id) ++pass_number;
     const bool skipped = debug_skip_pass() > 0 && pass_number == debug_skip_pass();
-    const bool ran = skipped ? false
-                             : session.run_after(device, cmd, output, kOutputState, resources, f->controls);
+    // The network reads the colour and writes the output (no seed copy; its post block stores
+    // into the output when it can). Where it cannot - still building, a failure, a format or
+    // extent mismatch, the model not applied - the output is seeded and the pass runs in place
+    // as before. NR_SEED_COPY=1 keeps the old order for comparisons.
+    static const bool seed_always = [] { const char* e = std::getenv("NR_SEED_COPY"); return e && std::atoi(e); }();
+    bool ran = false;
+    if (!skipped && !seed_always) {
+        // the seed copy's D3D12 transitions were also what made vkd3d-proton
+        // flush transfer work it batches on the CPU (a caller's CopyTextureRegion into the colour)
+        // into the command buffer before our raw Vulkan commands. A global UAV barrier - a real
+        // D3D12 command - does that without the copy.
+        D3D12_RESOURCE_BARRIER uav{};
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = nullptr;
+        cmd->ResourceBarrier(1, &uav);
+        ran = session.run_after(device, cmd, output, kOutputState, resources, f->controls, color, kColorState);
+    }
+    if (!ran) {
+        seed();
+        ran = skipped ? false : session.run_after(device, cmd, output, kOutputState, resources, f->controls);
+    }
 
     // (b) the model's answer, from the same resource in the same state, so the only difference
     // between the two buffers is what run_after recorded between them.
@@ -1239,6 +1261,25 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     frame.colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     frame.upscaler_input = false;   // OptiScaler already tone-mapped this; see EngineResources::colour_encoded
 
+    // The output written directly (Session::run_vulkan): only when it is the colour's twin - same
+    // format, and both descriptors' extents are the working size (no subrect to crop). The colour is
+    // an NGX input (sampled; this path already copies from it) and the output an NGX output this
+    // path already copies into; NGX's ReadWrite flag is the UAV one, i.e. storage usage - OptiScaler
+    // creates both with STORAGE|SAMPLED|TRANSFER and marks them ReadWrite.
+    {
+        uint32_t cw = 0, ch = 0; VkImage ci{}; VkFormat cf{};
+        image_of(color, &ci, &cf, &cw, &ch);
+        if (out_format == frame.colour_format && out_w == frame.width && out_h == frame.height &&
+            cw == frame.width && ch == frame.height) {
+            frame.output = out_image;
+            frame.output_layout = VK_IMAGE_LAYOUT_GENERAL;
+            frame.colour_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 (static_cast<const NVSDK_NGX_Resource_VK*>(color)->ReadWrite ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
+            frame.output_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 (static_cast<const NVSDK_NGX_Resource_VK*>(output)->ReadWrite ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
+        }
+    }
+
     if (image_of(motion, &frame.motion, &frame.motion_format, &frame.motion_width,
                  &frame.motion_height)) {
         frame.motion_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1267,7 +1308,9 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     VkImage answer = session.run_vulkan(g_vk_handles, cmd, frame, f->controls);
 
     const bool ran = answer != VK_NULL_HANDLE;
-    if (!ran) {
+    if (ran && answer == out_image) {
+        // Written in place by the network (Session::run_vulkan with VulkanFrame::output).
+    } else if (!ran) {
         // Still building, or declined. The output has to carry a picture either way, so it gets the
         // input unchanged -- the pass becomes a no-op rather than a black frame. OptiScaler's resolve
         // blends output against the same proxy, so an identical copy composites to exactly the proxy.

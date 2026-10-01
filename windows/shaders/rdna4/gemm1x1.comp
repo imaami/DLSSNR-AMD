@@ -443,6 +443,26 @@ layout(set = 0, binding = 6, std430) readonly buffer WgtF16x4 { f16vec4 wgt_f16x
 // plus NR_OUT_TILED is that producer.
 layout(set = 0, binding = 7, std430) NR_COH    buffer ActE4M3x4 { fe4m3vec4 act_e4m3x4[]; };
 #include "nr_prof.glsl"
+// Windows (LLPC) NR_GLD_U2: the A fragments (tiled, direct) and the N-pair B fragments read as
+// 8-/16-byte words. Assigned from the fe4m3vec4 views, LLPC loads each fragment a dword at a
+// time and builds it byte by byte (four buffer_load_b32 where ACO issues one b128); from a
+// uvec2/uvec4 through unpack8 the fragment is the loaded registers. Same bytes, same order.
+#ifndef NR_GLD_U2
+#define NR_GLD_U2 0
+#endif
+#if NR_GLD_U2
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActE4M3u2 { uvec2 act_u2[]; };
+#ifdef NR_PACKED_WEIGHT_N2
+layout(set = 0, binding = 3, std430) readonly buffer WgtPairU4 { uvec4 wgt_pair_u4[]; };
+#endif
+#define NR_FRAG_Q(frag, v) { const uvec2 nr_fv = (v); \
+    const u8vec4 nr_f0 = unpack8(nr_fv.x), nr_f1 = unpack8(nr_fv.y); \
+    for (int nr_z = 0; nr_z < 4; ++nr_z) { \
+        (frag)[nr_z] = uintBitsToFloate4m3EXT(nr_f0[nr_z]); \
+        (frag)[nr_z + 4] = uintBitsToFloate4m3EXT(nr_f1[nr_z]); } }
+#endif
 #if NR_XPIPE
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActU32V { uint act_u32v[]; };
@@ -1175,10 +1195,16 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 // tile-blocked layout are eight contiguous bytes - loaded through the packed
 // view with the lane term hoisted out of the loop, so each step is the
 // hoisted pointer plus the chunk offset plus a literal.
+#if NR_GLD_U2
+#define NR_LDA_I(i) { \
+    const uint nrq = (alane4[i] + akc4) + NR_AKOFF(kknext) / 4u; \
+    NR_FRAG_Q(fa[cur][i], act_u2[nrq / 2u]) }
+#else
 #define NR_LDA_I(i) { \
     const uint nrq = (alane4[i] + akc4) + NR_AKOFF(kknext) / 4u; \
     const fe4m3vec4 r0 = act_e4m3x4[nrq], r1 = act_e4m3x4[nrq + 1u]; \
     for (int v = 0; v < 4; ++v) { fa[cur][i][v] = r0[v]; fa[cur][i][v + 4] = r1[v]; } }
+#endif
 #elif NR_KOFF_SPLIT
 // k0 is a multiple of NR_KCHUNK, so (k0 + kk)/16 == k0/16 + kk/16. Adding
 // the per-chunk part once (akc/bkc) and the per-step part as a literal lets
@@ -1192,7 +1218,12 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 #define NR_LDA_I(i)  NR_LOAD_A(fa[cur][i], lds_a, \
         abase + (mloc + uint((i) * 16)) * uint(NR_KCHUNK) + kknext, uint(NR_KCHUNK));
 #endif
-#ifdef NR_PACKED_WEIGHT_N2
+#if defined(NR_PACKED_WEIGHT_N2) && NR_GLD_U2
+#define NR_LDB_J(j) if (((j)&1)==0) { \
+    const uvec4 nrw = wgt_pair_u4[NR_BADDR(j) / 4u]; \
+    NR_FRAG_Q(fb[cur][j], nrw.xy) \
+    NR_FRAG_Q(fb[cur][((j)+1)%NR_NFRAG], nrw.zw) }
+#elif defined(NR_PACKED_WEIGHT_N2)
 #define NR_LDB_J(j) if (((j)&1)==0) { \
     const uint nrq=NR_BADDR(j); \
     const fe4m3vec4 w0=wgt_pair4[nrq],w1=wgt_pair4[nrq+1u]; \

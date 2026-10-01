@@ -16,9 +16,9 @@ graphics cards.
   SSIM 0.997-0.998, and the output changes from frame to frame by about as much as NVIDIA's. Method,
   pictures and data: [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md).
 - **Tested only on an RX 9070 XT.** Other cards are not guaranteed to work.
-- **The Windows version is still in development and has serious problems.** It is clearly slower than
-  Linux, several games crash or do not work, and it is not ready for normal use. The current Windows
-  code has not been tested in games at all; you have to test and, if needed, fix it yourself.
+- **The Windows version is an experimental preview and has not been tested much.** Game crashes,
+  driver resets and other unexpected problems can happen, and it is slower than Linux. See
+  [Windows](#windows-experimental-preview).
 
 This is an independent project. It is not affiliated with, endorsed by or supported by NVIDIA or
 AMD. DLSS is a trademark of NVIDIA Corporation.
@@ -41,14 +41,20 @@ will keep changing, including in ways that break earlier setups.
 - It is provided as is, without warranty (see [LICENSE](LICENSE)).
 
 If something goes wrong, please open an issue with the game, the route, your card and driver, and
-`dlssnr-amd.log` from the game folder.
+these logs:
+
+- `dlssnr-amd.log` and `OptiScaler.log` or `ReShade.log` (whichever route you use), all in the game
+  folder. On Windows, option 5 of `install.bat` puts them into one zip.
+- On Linux, if you can, a Proton log as well: set the game's launch options in Steam to
+  `PROTON_LOG=1 %command%`, run the game until the problem shows, and attach `steam-<appid>.log` from
+  your home folder.
 
 ## Status
 
 | Platform | Needs | State |
 | --- | --- | --- |
 | **Linux** (Steam / Proton) | Mesa 26.2 or newer, GE-Proton 11-7 (tested) | The main version, used in games. |
-| **Windows** | AMD Software 25.10 or newer | **Experimental and far from finished.** Clearly slower than Linux, several games do not work, no ready-made packages - you have to build it yourself. |
+| **Windows** | AMD Software 25.10 or newer | **Experimental preview, not tested much.** Slower than Linux; game crashes, driver resets and other problems can happen. |
 
 Both need an RX 9000 series (RDNA4) card; older cards (RX 7000 and earlier) lack the FP8 matrix
 instructions the network needs.
@@ -56,12 +62,12 @@ instructions the network needs.
 ## Performance
 
 GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network only), measured
-with v0.0.2.2:
+with v0.0.3:
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| Linux | 5.60 ms | 9.89 ms | 22.32 ms |
-| Windows | 7.79 ms | - | 28.9 ms |
+| Linux | 5.60 ms | 9.70 ms | 21.89 ms |
+| Windows | 7.21 ms | 12.59 ms | 27.32 ms |
 
 In game (Linux, RX 9070 XT):
 
@@ -143,17 +149,19 @@ look; it may be better or worse.
 The first time the preprocess is turned on, NR rebuilds; a second or two of frames go without NR.
 The file itself explains every setting.
 
-## Why Vulkan (and not HIP)
+## Why Vulkan
 
 HIP would work too: ROCm supports RDNA4 and its matrix (WMMA) instructions. Vulkan fits this job
 better:
 
 - The network runs on the game's own Vulkan device and queue (DXVK / vkd3d-proton under Proton). The
   frame never leaves that device, and no second GPU context or cross-API synchronisation is needed.
-- Nothing extra to install: Vulkan comes with the graphics driver. HIP needs ROCm (Linux) or the HIP
-  SDK (Windows), plus a bridge to reach it from inside a Wine/Proton process.
-- RDNA4's matrix instructions are available in Vulkan through `VK_KHR_cooperative_matrix`, and one set
-  of shaders serves Linux and Windows.
+- Nothing extra to install: Vulkan comes with the graphics driver. On Linux the HIP runtime
+  (`libamdhip64`) is not part of Mesa and has to be installed separately (ROCm or the distribution's
+  packages), plus a bridge to reach it from a game running in Proton (a Windows process). On Windows
+  the AMD driver includes it (`amdhip64_7.dll` in current drivers).
+- RDNA4's matrix instructions are available in Vulkan through `VK_KHR_cooperative_matrix`, both in
+  Mesa (Linux) and in the AMD Windows driver.
 
 How the routes work in detail, and where the code is: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -171,6 +179,15 @@ The folder is the one holding the game's exe. The installer lists the routes, ex
 the extracted model is kept and reused for every later one. Needs `bash` and `python3`. See
 [linux/package/README.txt](linux/package/README.txt).
 
+## Install (Windows)
+
+Download `DLSSNR-AMD-Windows-*-preview-x64.zip` from the releases, unpack it and double-click
+`install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route. The
+first install asks for `nvngx_dlssnr.dll` 310.8.0 or a zip that contains it and extracts the model
+(below); later installs from the same package do not ask again. Read
+[windows/package/README.txt](windows/package/README.txt) and [Windows](#windows-experimental-preview)
+first.
+
 ## The model
 
 The weights are NVIDIA's and are not part of this project. They are extracted from your own copy of
@@ -180,7 +197,8 @@ The weights are NVIDIA's and are not part of this project. They are extracted fr
   subfolder).
 - A DLL of any other version is refused.
 - All 599 extracted entries are checked against known hashes; the model file is written only if every
-  one matches. It takes about 20 seconds and needs `bash` and `python3`.
+  one matches. On Linux it takes about 20 seconds and needs `bash` and `python3`. The Windows package
+  does the same with `model-tools\dlssnr_extract_model.exe` (no Python needed), in about a second.
 - The extracted model is kept in the package's own `dlssnr-amd/dlssnr.bin`. Later installs from
   that package without `--dll` check its SHA256 and install it from there, so the extraction runs
   only once per package. With a new package, use `--dll` once more or copy that file over.
@@ -196,32 +214,38 @@ bash model-tools/extract_model.sh nvngx_dlssnr_310.8.0.zip dlssnr.bin
 ```
 
 On success it prints `599 entries, 140.9 MiB` (147,756,560 bytes). Put the file at
-`<game folder>/dlssnr-amd/dlssnr.bin`, or pass it to a package build with `NR_MODEL=` (the Windows
-package needs this; its installer does not extract the model).
+`<game folder>/dlssnr-amd/dlssnr.bin`, or pass it to a package build with `NR_MODEL=`.
 
-## Windows
+On Windows, `install.bat` extracts the model by itself; to run the tool on its own:
 
-**The Windows version is still in development and has serious problems. It is not ready for normal
-use.**
+```bat
+model-tools\dlssnr_extract_model.exe nvngx_dlssnr.dll dlssnr.bin
+```
 
-The latest update makes the Windows network faster in the **offline benchmark** (1080p 9.4 -> 7.79 ms,
-4K 33 -> 28.9 ms), but this version has not been tested in any game. There is no guarantee that it
-runs correctly in games; expect to test it yourself and possibly change the code to get it working.
+It takes the DLL itself; unpack it from the zip first.
+
+## Windows (experimental preview)
+
+**The Windows version is an experimental preview and has not been tested much.** Game crashes, driver
+resets and other unexpected problems can happen. It is built from the same code as the Linux version
+and changed only where the AMD Windows driver needs it. It is updated less often than the Linux
+version, and some releases may be Linux only.
 
 Known issues:
 
-- It is clearly slower than the Linux version (see Performance).
+- It is slower than the Linux version (see Performance).
+- The first time NR runs in a game, the network compiles for about a minute before it takes effect
+  (on Linux about 10-20 seconds); this happens once for each game. Until then the picture looks as
+  without NR, which does not mean the mod is not working: give it a minute.
 - Every game has to run on DXVK / vkd3d-proton, which changes the game's own performance and
   behaviour.
-- Several games crash or do not work: DX11 games cannot use the OptiScaler route, overlays (Steam and
-  others) conflict, Final Fantasy XIV crashes together with Dalamud, and the network pauses itself
-  when video or system memory runs short.
+- The OptiScaler route is for DirectX 12 games only. Games whose FSR runs in their own shaders need
+  their DLSS option instead, which OptiScaler offers.
+- Overlays (Steam and others) can conflict, and the network pauses itself when video or system memory
+  runs short.
 - The picture is not the same as the Linux version's. The Windows network is built for the AMD
   Windows driver's shader compiler and rounds differently in places; on a 1080p test frame the two
   outputs are 48.6 dB PSNR apart.
-
-There are no ready-made Windows packages; build one yourself (next section). Read
-[windows/package/README.txt](windows/package/README.txt) for its known limits before trying it.
 
 ## Build
 
@@ -241,15 +265,14 @@ Do not share packages that contain the model.
 
 ### Windows package
 
-The Windows installer does not extract the model, so the package has to carry one:
-
 ```sh
 bash fetch_deps.sh --windows                # adds GE-Proton 11-7 (DXVK, vkd3d-proton)
-bash linux/package/model-tools/extract_model.sh nvngx_dlssnr_310.8.0.zip dlssnr.bin
-NR_MODEL=$PWD/dlssnr.bin bash windows/build/build_package.sh
+bash windows/build/build_package.sh
 ```
 
 The result is `windows/package/DLSSNR-AMD-Windows-*-x64.zip`; on Windows, run `install.bat` from it.
+It contains no model; the installer extracts it on the first install. `NR_MODEL=/path/to/dlssnr.bin`
+puts one into the package for your own use. Do not share packages that contain the model.
 
 ## Licence
 

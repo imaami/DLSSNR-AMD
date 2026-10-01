@@ -22,6 +22,12 @@ namespace nr::pe::vkdevice {
 // and this reports false.
 bool install();
 
+// Take the hooks out again. ReShade unloads its add-ons whenever its last
+// device goes away - a game that makes a probe device and destroys it does
+// that mid-run - and vulkan-1.dll stays loaded under DXVK/vkd3d-proton, so a
+// hook left behind jumps into unmapped code at the next vkCreateInstance.
+void uninstall();
+
 // The game's handles, once it has made a device. Invalid until then.
 DeviceHandles handles();
 

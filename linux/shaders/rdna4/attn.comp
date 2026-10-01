@@ -738,6 +738,15 @@ float nr_fast_exp(float x) {
 #ifndef NR_QKV_DONE
 #define NR_QKV_DONE 0
 #endif
+#ifndef NR_ATTN_BPF
+#define NR_ATTN_BPF 0
+#endif
+#if NR_ATTN_BPF
+#if !(NR_ATTN_TRANSPOSE && NR_ATTN_EXP2 && !NR_ATTN_BIAS_SEED && NR_SHARE_HEAD && !NR_OOB_SKIP)
+#error "NR_ATTN_BPF: the shipping transposed EXP2 attention"
+#endif
+#define NR_BPF_IT (NR_WIN / (NR_IROWS * NR_AWAVES))
+#endif
 #if NR_ATTN_EDGE
 #define NR_QDEAD(i) ((((NR_QLIVE) >> (i)) & 1) == 0)
 #else
@@ -778,7 +787,34 @@ float nr_fast_exp(float x) {
 #else
 #define NR_QOOB
 #endif
-#if NR_ATTN_KOFF
+#ifndef NR_ATTN_WPAIR
+#define NR_ATTN_WPAIR 0
+#endif
+#ifndef NR_DIAG_AWFOLD
+#define NR_DIAG_AWFOLD 0
+#endif
+#if NR_ATTN_WPAIR
+// NR_ATTN_WPAIR: the QKV weights in the host's N-pair layout (gemm1x1's
+// NR_PACKED_WEIGHT_N2: two adjacent 16-channel tiles interleaved per lane, 512
+// bytes a k tile), so fragments 2p and 2p+1 are one 16-byte load. A head's six
+// tiles start at an even tile (6h). Same bytes, same MMAs: byte-identical.
+#if !(NR_ATTN_KOFF && NR_AN == 6 && NR_APARTS == 1)
+#error "NR_ATTN_WPAIR: the KOFF shipping shape (AN=6, one part)"
+#endif
+#define NR_QLB_J(j) if (((j) & 1) == 0) { const uint nrq = (qbl4[((j) / 2) % NR_AN] + 2u * k04) + kkl * 8u; \
+    { const fe4m3vec4 r0 = wgt_e4m3x4[nrq], r1 = wgt_e4m3x4[nrq + 1u]; \
+      for (int v = 0; v < 4; ++v) { qfb[cur][j][v] = r0[v]; qfb[cur][j][v + 4] = r1[v]; } \
+      NR_QSW_B(j) } \
+    { const fe4m3vec4 r0 = wgt_e4m3x4[nrq + 2u], r1 = wgt_e4m3x4[nrq + 3u]; \
+      for (int v = 0; v < 4; ++v) { qfb[cur][((j) + 1) % NR_AN][v] = r0[v]; qfb[cur][((j) + 1) % NR_AN][v + 4] = r1[v]; } \
+      NR_QSW_B(((j) + 1) % NR_AN) } }
+#elif NR_ATTN_KOFF && NR_DIAG_AWFOLD
+// diagnostic (wrong picture): the QKV weight reads folded into the matrix's first NR_DIAG_AWFOLD u32s.
+#define NR_QLB_J(j) { const uint nrq = (pc.w_off / 4u) + ((((qbl4[j] + k04) + kkl * 4u) - pc.w_off / 4u) & uint(NR_DIAG_AWFOLD - 1)); \
+    const fe4m3vec4 r0 = wgt_e4m3x4[nrq], r1 = wgt_e4m3x4[nrq + 1u]; \
+    for (int v = 0; v < 4; ++v) { qfb[cur][j][v] = r0[v]; qfb[cur][j][v + 4] = r1[v]; } \
+    NR_QSW_B(j) }
+#elif NR_ATTN_KOFF
 #define NR_QLB_J(j) { const uint nrq = (qbl4[j] + k04) + kkl * 4u; \
     const fe4m3vec4 r0 = wgt_e4m3x4[nrq], r1 = wgt_e4m3x4[nrq + 1u]; \
     for (int v = 0; v < 4; ++v) { qfb[cur][j][v] = r0[v]; qfb[cur][j][v + 4] = r1[v]; } \
@@ -959,7 +995,13 @@ void main() {
             const uint nr_ql = (lane & 15u) * 16u + (lane >> 4u) * 8u;
             uint qal4[NR_AM], qbl4[NR_AN];
             for (int i = 0; i < NR_AM; ++i) qal4[i] = (qabase[i] + nr_ql) / 4u;
+#if NR_ATTN_WPAIR
+            // pair record p of the head: tiles (6h + 2p, 6h + 2p + 1), lane's 16 bytes at lane*16
+            for (int j = 0; j < NR_AN / 2; ++j)
+                qbl4[j] = (pc.w_off + ((hrow / 32u) + uint(j)) * (pc.C / 16u) * 512u + lane * 16u) / 4u;
+#else
             for (int j = 0; j < NR_AN; ++j) qbl4[j] = (qbbase[j] + nr_ql) / 4u;
+#endif
 #endif
             NR_FRAG_ACC qacc[NR_AM][NR_AN];
             NR_FOR_I(NR_AM, NR_QZ_I)
@@ -990,8 +1032,14 @@ void main() {
             // accumulators, so its loads and MMAs are dead. The wave's two
             // tiles give four patterns; each is its own copy of the loop with
             // the mask a compile-time constant (no per-tile phis).
+#ifdef NR_DIAG_NOQKV
+            // diagnostic (wrong picture): every tile takes the no-projection
+            // body, so the dispatch prices stage 2 (logits, softmax, context) alone.
+            const uint nr_ql2 = 0u;
+#else
             const uint nr_ql2 = (nr_tile_oob(mtok0 / 16u) ? 0u : 1u)
                               | (nr_tile_oob(mtok0 / 16u + 1u) ? 0u : 2u);
+#endif
 #if !(NR_USE_FUSED_QK_NORM && NR_ATTN_QKSWAP)
 #error "NR_ATTN_EDGE: the shipping fused-norm QKSWAP epilogue only"
 #endif
@@ -1179,6 +1227,18 @@ void main() {
 #endif
 #endif // NR_USE_FUSED_QK_NORM
         }
+#if NR_ATTN_BPF
+        // NR_ATTN_BPF: the position bias of every row block this wave will
+        // run, issued before the barrier (stage 1's accumulators are dead here),
+        // so its L2 latency hides behind the barrier and the first logits instead
+        // of stalling each block's exponential. Same values, same adds.
+        float nr_bpf[NR_BPF_IT][4][8];
+        for (int it = 0; it < NR_BPF_IT; ++it)
+            for (int n = 0; n < 4; ++n)
+                for (int c = 0; c < 8; ++c)
+                    nr_bpf[it][n][c] = wgt_f32[pc.b_off + (h * 64u + i0beg + uint(it) * i0inc + lane % 16u) * 64u
+                                               + uint(n) * 16u + 8u * (lane / 16u) + uint(c)];
+#endif
         // Q, K and V are shared now, so this one has to be the whole workgroup.
         NR_QKVBAR();
 
@@ -1220,7 +1280,12 @@ void main() {
         // accumulator components are already the B operands for V^T.P^T,
         // removing the probability LDS round trip. Keep the old FP32 sum
         // tree: four key tiles first, then key bits 0, 1, 2, 3.
+#if NR_ATTN_BPF
+        [[unroll]] for (int nr_it = 0; nr_it < NR_BPF_IT; ++nr_it) {
+            const uint i0 = i0beg + uint(nr_it) * i0inc;
+#else
         for (uint i0 = i0beg; i0 < uint(NR_WIN); i0 += i0inc) {
+#endif
 #if NR_OOB_SKIP && NR_IMAGE
             // This query tile's context is never stored.
             if (nr_tile_oob(i0 / 16u)) continue;
@@ -1255,8 +1320,13 @@ void main() {
                     const uint query = i0 + lane % 16u;
                     const uint key = uint(n) * 16u + 8u * (lane / 16u) + uint(c);
                     const uint bo = pc.b_off + (h * 64u + query) * 64u + key;
+#if NR_ATTN_BPF
+                    const f16vec2 e2 = nr_swin_exp2(vec2(lg[n][c] + nr_bpf[nr_it][n][c],
+                                                         lg[n][c + 1] + nr_bpf[nr_it][n][c + 1]));
+#else
                     const f16vec2 e2 = nr_swin_exp2(vec2(lg[n][c] + wgt_f32[bo],
                                                          lg[n][c + 1] + wgt_f32[bo + 1u]));
+#endif
                     const float ex = float(e2.x), ey = float(e2.y);
                     lg[n][c] = ex; lg[n][c + 1] = ey;
                     den[c] += ex; den[c + 1] += ey;

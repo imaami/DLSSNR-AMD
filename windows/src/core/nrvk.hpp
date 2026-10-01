@@ -817,8 +817,14 @@ struct Kernel {
         NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        // NR_DUMP_IR=<dir> (evaluation builds): also capture the driver's internal representations
+        // and write each one to <dir>/<spv>.<executable>.<name>.txt. No pipeline cache then.
+        const char* dump_ir = std::getenv("NR_DUMP_IR");
+        if (ctx.pipeline_stats && dump_ir && *dump_ir)
+            cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
-        const VkResult made = vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline);
+        const VkResult made = vkCreateComputePipelines(device, (dump_ir && *dump_ir) ? VK_NULL_HANDLE : ctx.pipeline_cache,
+                                                       1, &cpi, nullptr, &pipeline);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);
@@ -839,6 +845,26 @@ struct Kernel {
                     std::vector<VkPipelineExecutableStatisticKHR> s(
                         ns, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
                     if (stats(device, &ei, &ns, s.data()) != VK_SUCCESS) continue;
+                    if (dump_ir && *dump_ir) {
+                        auto irs = reinterpret_cast<PFN_vkGetPipelineExecutableInternalRepresentationsKHR>(
+                            vkGetDeviceProcAddr(device, "vkGetPipelineExecutableInternalRepresentationsKHR"));
+                        uint32_t nr = 0;
+                        if (irs && irs(device, &ei, &nr, nullptr) == VK_SUCCESS && nr) {
+                            std::vector<VkPipelineExecutableInternalRepresentationKHR> r(
+                                nr, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+                            irs(device, &ei, &nr, r.data());
+                            std::vector<std::vector<char>> buf(nr);
+                            for (uint32_t i = 0; i < nr; ++i) { buf[i].resize(r[i].dataSize + 1); r[i].pData = buf[i].data(); }
+                            irs(device, &ei, &nr, r.data());
+                            for (uint32_t i = 0; i < nr; ++i) {
+                                std::string fn = std::string(dump_ir) + "/" + base + "." + std::to_string(e) + "." + std::to_string(i) + ".txt";
+                                std::ofstream f(fn, std::ios::binary);
+                                f << "# " << r[i].name << " : " << r[i].description << "\n";
+                                f.write(buf[i].data(), std::streamsize(r[i].dataSize));
+                            }
+                            std::printf(" | ir=%u", nr);
+                        }
+                    }
                     for (const auto& x : s) {
                         std::printf(" | %s=", x.name);
                         switch (x.format) {

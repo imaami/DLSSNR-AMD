@@ -19,6 +19,9 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_float_e4m3 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#if defined(NR_CVT4_SPLIT) && NR_CVT4_SPLIT == 3
+#extension GL_EXT_spirv_intrinsics : require
+#endif
 
 #define NR_MMA_M 16
 #define NR_MMA_N 16
@@ -386,6 +389,43 @@ NR_E4M3 nr_quant_e4m3(float v) {
 #ifndef NR_ABLATE_CVT
 #define NR_ABLATE_CVT 0
 #endif
+// NR_CVT4_SPLIT (Windows): a four-wide e4m3 conversion as two pair conversions. The driver's
+// LLPC (true16) converts the second pair into the high half of a *copy* of the first pair's
+// result and merges the two with v_bfi_b32: two extra VALU a dword (fswin32: 568 + 514), the same
+// for cooperative-matrix conversions. Same conversions, same bytes; only the IR shape changes.
+// 1: two fe4m3vec2 put together - shift + and_or instead, no gain. 3: each pair bit-cast to an
+// f16 and the two built as an f16 pair - about one v_perm a dword, but every pair now has its own
+// MODE write (fswin32 621 -> 1237 s_setreg): faster only in the two-wave image blocks
+// (fswinimagepost32 4K -0.046 ms, preds32 -0.008), slower in fswin32 and the persistent runs.
+// (An int16 spelling, pack16 + u16vec2, was a shift/perm mess.)
+#ifndef NR_CVT4_SPLIT
+#define NR_CVT4_SPLIT 0
+#endif
+#if NR_CVT4_SPLIT == 3
+// Each half bit-cast to an f16 (OpBitcast), the two put side by side as an f16 pair, cast back.
+spirv_instruction(id = 124) float16_t nr_bc_e2_h(fe4m3vec2 v);
+spirv_instruction(id = 124) fe4m3vec4 nr_bc_h2_e4(f16vec2 v);
+fe4m3vec4 nr_cvt4_split(vec4 x) {
+    return nr_bc_h2_e4(f16vec2(nr_bc_e2_h(fe4m3vec2(x.xy)), nr_bc_e2_h(fe4m3vec2(x.zw))));
+}
+fe4m3vec4 nr_cvt4_split(f16vec4 x) {
+    return nr_bc_h2_e4(f16vec2(nr_bc_e2_h(fe4m3vec2(x.xy)), nr_bc_e2_h(fe4m3vec2(x.zw))));
+}
+#elif NR_CVT4_SPLIT
+fe4m3vec4 nr_cvt4_split(vec4 x) {
+    const fe4m3vec2 p = fe4m3vec2(x.xy), q = fe4m3vec2(x.zw);
+    return fe4m3vec4(p.x, p.y, q.x, q.y);
+}
+fe4m3vec4 nr_cvt4_split(f16vec4 x) {
+    const fe4m3vec2 p = fe4m3vec2(x.xy), q = fe4m3vec2(x.zw);
+    return fe4m3vec4(p.x, p.y, q.x, q.y);
+}
+#endif
+#if NR_CVT4_SPLIT
+#define NR_CVT4(x) nr_cvt4_split(x)
+#else
+#define NR_CVT4(x) fe4m3vec4(x)
+#endif
 #if NR_ABLATE_CVT
 fe4m3vec4 nr_fake4(vec4 x) {
     const uvec4 u = floatBitsToUint(x) >> 24u;
@@ -531,14 +571,14 @@ fe4m3vec4 nr_quant_quad(f16vec2 a, f16vec2 b) {
     return nr_fake4(vec4(vec2(a), vec2(b)));
 #endif
     const vec4 x = vec4(vec2(a), vec2(b));
-    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+    return NR_CVT4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
 }
 fe4m3vec4 nr_quant_quad32(vec2 a, vec2 b) {
 #if NR_ABLATE_CVT
     return nr_fake4(vec4(a, b));
 #endif
     const vec4 x = vec4(a, b);
-    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+    return NR_CVT4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
 }
 #elif NR_QUANT_EXPLICIT && NR_ABLATE_QUANT
 // Diagnostic: the quad forms without the range step (wrong output; prices the clamp).
@@ -552,8 +592,8 @@ fe4m3vec4 nr_quant_quad32(vec2 a, vec2 b) { return fe4m3vec4(vec4(a, b)); }
 fe4m3vec4 nr_convert_quad(f16vec2 a, f16vec2 b) { return nr_fake4(vec4(vec2(a), vec2(b))); }
 fe4m3vec4 nr_convert_quad(vec2 a, vec2 b) { return nr_fake4(vec4(a, b)); }
 #else
-fe4m3vec4 nr_convert_quad(f16vec2 a, f16vec2 b) { return fe4m3vec4(f16vec4(a, b)); }
-fe4m3vec4 nr_convert_quad(vec2 a, vec2 b) { return fe4m3vec4(vec4(a, b)); }
+fe4m3vec4 nr_convert_quad(f16vec2 a, f16vec2 b) { return NR_CVT4(f16vec4(a, b)); }
+fe4m3vec4 nr_convert_quad(vec2 a, vec2 b) { return NR_CVT4(vec4(a, b)); }
 #endif
 
 // The same conversion with the **saturation** removed and nothing else: no
@@ -588,10 +628,10 @@ fe4m3vec4 nr_quant4_h(f16vec4 v) {
     return nr_fake4(vec4(v));
 #endif
 #if NR_QUANT_MODE == 1 || NR_QUANT_MODE == 5
-    return fe4m3vec4(clamp(v, f16vec4(-448.0), f16vec4(448.0)));
+    return NR_CVT4(clamp(v, f16vec4(-448.0), f16vec4(448.0)));
 #elif NR_QUANT_MODE == 4 && defined(NR_QUANT_EXPLICIT) && NR_QUANT_EXPLICIT && !NR_ABLATE_QUANT
     const vec4 x = vec4(v);
-    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+    return NR_CVT4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
 #else
     return fe4m3vec4(nr_quant_e4m3(v.x), nr_quant_e4m3(v.y), nr_quant_e4m3(v.z), nr_quant_e4m3(v.w));
 #endif

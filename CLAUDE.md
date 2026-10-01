@@ -49,8 +49,9 @@ Measured facts worth knowing before changing kernels:
 
 - The version comes from git tags only (`*/build/version.sh`): tag `v0.0.1` builds as `0.0.1`, later
   commits as `0.0.1-3-g1a2b3c4`. Package names and the DLLs' log lines carry it.
-- Releasing: `git tag v0.0.2 && git push origin v0.0.2`. CI builds the Linux packages and publishes a
-  GitHub release. The Windows package is never built by CI.
+- Releasing: `git tag v0.0.2 && git push origin v0.0.2`. CI (.github/workflows/packages.yml) builds
+  the Linux packages and the Windows package and publishes a GitHub release. For a Linux-only release,
+  set the repository variable `WINDOWS_PACKAGE` to `off` first (`gh variable set WINDOWS_PACKAGE --body off`).
 
 ## Style
 
