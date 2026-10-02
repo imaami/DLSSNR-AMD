@@ -124,8 +124,12 @@ layout(set = 0, binding = 0, std430) coherent buffer NrChainU { uint nr_chain_u[
 #define NR_TCHAIN_FIELDS uint tc_rec;
 layout(set = 0, binding = 0, std430) coherent buffer NrTChainU { uint nr_tc_u[]; };
 layout(set = 0, binding = NR_TC_WBIND, std430) readonly buffer NrTChainW { uint nr_tc_w[]; };
+// The bound, 2^17 polls: about 26 ms on an RX 9070 XT with one workgroup
+// polling, up to 110 ms with 2048. Another process's compute load whose
+// workgroups hold the compute units for 10 to 65 ms ran out the waits of 6 to
+// 11% of frames at 2^16 and 0.05 to 0.2% at 2^17, at the same frame-time p99.
 #ifndef NR_TCHAIN_BOUND
-#define NR_TCHAIN_BOUND (1u << 16)
+#define NR_TCHAIN_BOUND (1u << 17)
 #endif
 // Every NR_TCHAIN main starts with this: the record's signal word, loaded once
 // into an SGPR (a buffer load, so the compiler cannot re-load it at the end).
