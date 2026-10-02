@@ -93,6 +93,25 @@ layout(set = 0, binding = 0, std430) coherent buffer NrChainU { uint nr_chain_u[
 // (Across engines the order is not global - a consumer can start while another
 // engine still launches producers; measured.) The wait is bounded anyway and
 // sets the error word, so a protocol bug cannot hang the GPU.
+//
+// What does make a wait run out is another client of the GPU (another
+// process's compute queue, a game's async compute) holding the compute units
+// a producer still needs. The waits of the frame that come after are then
+// most likely to run out too, each spending its own bound, so a wait gives up
+// early once the frame's error word says that one already has: every
+// NR_ERR_POLLS polls it reads the word, and gives up when the word holds this
+// frame's number. A wait that runs out writes twice the frame's number
+// (atomicMax), not a flag: a wait that gives up leaves the counters whole -
+// its producer still signals - so the next frame waits normally. A persistent
+// run that gives up writes twice the number plus one (fswin_t.comp). Both
+// grow from frame to frame, so a word that no host clears still names the
+// last frame in which a wait gave up. A host that names one error word in
+// every record thereby stops the frame's tile waits once one has run out, and
+// all of its waits, the persistent runs' claims too, once a run has given up a
+// claim.
+#ifndef NR_ERR_POLLS
+#define NR_ERR_POLLS 64u
+#endif
 #ifndef NR_TCHAIN
 #define NR_TCHAIN 0
 #endif
@@ -125,9 +144,15 @@ layout(set = 0, binding = NR_TC_WBIND, std430) readonly buffer NrTChainW { uint 
 #define NR_TC_WAIT_BEGIN \
     if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 2u] != 0xFFFFFFFFu) { \
         if (gl_SubgroupID == 0u) { \
-            const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u]; \
+            const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u], nr_terr = nr_tc_w[nr_tc_rec + 5u]; \
             const uint nr_te = subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 0u)); \
             uint nr_tb = NR_TCHAIN_BOUND;
+// One poll of budget NR_B spent; every NR_ERR_POLLS polls the budget drops
+// to 0 once error word NR_ERR names frame NR_F.
+#define NR_TC_POLLED(nr_b, nr_err, nr_f) \
+    if ((--nr_b & (NR_ERR_POLLS - 1u)) == 0u && \
+        subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_err], 0u)) >> 1u == (nr_f)) \
+        nr_b = 0u;
 // A table entry: the producer counter (low 20 bits) and how many producer units
 // a frame complete it (high 12 bits); ~0 = nothing to wait for.
 #define NR_TC_WAIT_TILE(nr_tile_id) { \
@@ -135,9 +160,9 @@ layout(set = 0, binding = NR_TC_WBIND, std430) readonly buffer NrTChainW { uint 
             if (nr_tx != 0xFFFFFFFFu) \
                 while (nr_tb != 0u && subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_twt + (nr_tx & 0xFFFFFu)], 0u)) \
                        < (nr_tx >> 20u) * nr_te) \
-                    --nr_tb; }
+                    NR_TC_POLLED(nr_tb, nr_terr, nr_te) }
 #define NR_TC_WAIT_END \
-            if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_w[nr_tc_rec + 5u]], 1u); \
+            if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_terr], nr_te << 1u); \
         } \
         barrier(); \
         memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire); \

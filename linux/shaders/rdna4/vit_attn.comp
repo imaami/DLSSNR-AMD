@@ -376,20 +376,21 @@ void main() {
     // the lanes each poll their own tiles, so a ready producer costs one round trip, not one
     // a tile. Launched right behind the QKV (no barrier), the wait replaces the drain + ramp.
     if (nr_tc_rec != 0xFFFFFFFFu && nr_tc_w[nr_tc_rec + 2u] != 0xFFFFFFFFu) {
-        const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u];
+        const uint nr_twt = nr_tc_w[nr_tc_rec], nr_ttb = nr_tc_w[nr_tc_rec + 2u], nr_terr = nr_tc_w[nr_tc_rec + 5u];
         const uint nr_te = subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_w[nr_tc_rec + 4u]], 0u));
         const uint nr_nt = (pc.tokens + 15u) / 16u;
         uint nr_tb = NR_TCHAIN_BOUND;
-        bool nr_ok;
-        do {
-            nr_ok = true;
+        while (nr_tb != 0u) {
+            bool nr_ok = true;
             for (uint nr_t = gl_LocalInvocationID.x; nr_t < nr_nt; nr_t += gl_SubgroupSize) {
                 const uint nr_tx = nr_tc_w[nr_ttb + nr_t];
                 if (nr_tx != 0xFFFFFFFFu &&
                     atomicAdd(nr_tc_u[nr_twt + (nr_tx & 0xFFFFFu)], 0u) < (nr_tx >> 20u) * nr_te) nr_ok = false;
             }
-        } while (!subgroupAll(nr_ok) && --nr_tb != 0u);
-        if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_w[nr_tc_rec + 5u]], 1u);
+            if (subgroupAll(nr_ok)) break;
+            NR_TC_POLLED(nr_tb, nr_terr, nr_te)
+        }
+        if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_terr], nr_te << 1u);
         memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
     }
 #endif

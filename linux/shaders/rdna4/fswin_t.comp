@@ -1668,10 +1668,12 @@ shared NR_F16 image_features[64*32];
 // item i to workgroup `i % gridDim` statically, which is correct only while
 // all of them are launched at once - exactly the assumption a shared GPU
 // breaks.) The budget below stays as the last line of defence for a wiring
-// bug: a whole-dispatch poll budget per workgroup, so the worst case is one
-// timeout's wall time and not one per item - past it every wait returns
-// immediately, the error word carries the layer, and the host prints it. A
-// wrong picture, bounded in time - never a hang.
+// bug or another client that starves the run: a whole-dispatch poll budget per
+// workgroup, and once one workgroup has spent its budget every other gives up
+// at its next read of the run's error word, so the worst case is about one
+// timeout's wall time and not one per item or per workgroup - the error word
+// carries the layer, and the host prints it. A wrong picture, bounded in time
+// - never a hang.
 //
 // The claim is broadcast **through global memory, not LDS**: one `shared uint`
 // costs a kilobyte of LDS at the 1 KB allocation granularity, which at C=256
@@ -2676,6 +2678,30 @@ void main() {
         nr_tc_sig  = nr_tc_w[pcp.tc_rec + 3u]; nr_tc_err = nr_tc_w[pcp.tc_rec + 5u];
     }
 #endif
+    // Giving up early (nr_chain.glsl). A claim whose wait runs out leaves the
+    // item at its queue position unrun, so that item's consumers are never
+    // enqueued, in this frame or a later one (their counters stay short until
+    // the host zeroes the region). The run's error word therefore stays set,
+    // and every claim wait of the run gives up once it is set, read every
+    // NR_ERR_POLLS polls. A claim that gives up also writes twice the frame's
+    // number plus one into the record's error word, which stops the tile waits
+    // after the run and, where the host names that word in every record, the
+    // claims of the frame's other runs. A tile wait that ran out writes twice
+    // the number and does not stop the claims: the run's items stay runnable,
+    // and a run that gave up a claim would stay broken.
+#ifndef NR_ERR_POLLS
+#define NR_ERR_POLLS 64u    // as nr_chain.glsl
+#endif
+#if NR_TCHAIN
+#define NR_P_RUN_BROKE (nr_tc_err != 0u && atomicAdd(nr_tc_u[nr_tc_err], 0u) == (nr_epoch << 1u | 1u))
+#define NR_P_GAVE_UP(nr_code) { atomicMax(nr_sync[pcp.sync_off + 3u], nr_code); \
+                                if (nr_tc_err != 0u) atomicMax(nr_tc_u[nr_tc_err], nr_epoch << 1u | 1u); }
+#else
+#define NR_P_RUN_BROKE false
+#define NR_P_GAVE_UP(nr_code) atomicMax(nr_sync[pcp.sync_off + 3u], nr_code);
+#endif
+#define NR_P_GIVE_UP (nr_budget == 0u || ((--nr_budget & (NR_ERR_POLLS - 1u)) == 0u && \
+                      (atomicAdd(nr_sync[pcp.sync_off + 3u], 0u) != 0u || NR_P_RUN_BROKE)))
     const uint nr_slot = pcp.sync_off + 4u + pcp.total_windows + gl_WorkGroupID.x;
     // Items are numbered layer-major and claimed in increasing order, so a
     // workgroup's own layer only ever moves forward: the scan is a walk, not a
@@ -2845,8 +2871,7 @@ void main() {
                 uint nr_poll = 0u;
 #endif
                 while ((e & 0xFFFF0000u) != nr_tag) {
-                    if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
-                    --nr_budget;
+                    if (NR_P_GIVE_UP) { NR_P_GAVE_UP(1u) break; }
 #if NR_STRAG_ESC
                     // Never sit on a normal reservation while a straggler waits:
                     // only old workgroups take stragglers, so with every old one
@@ -2889,15 +2914,13 @@ void main() {
                 if (qa != 0xFFFFFFFFu) {
                     uint e = atomicAdd(nr_sync[qa], 0u);
                     while ((e & 0xFFFF0000u) != nr_tag) {
-                        if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
-                        --nr_budget;
+                        if (NR_P_GIVE_UP) { NR_P_GAVE_UP(1u) break; }
                         e = atomicAdd(nr_sync[qa], 0u);
                     }
                     if ((e & 0xFFFF0000u) == nr_tag) it = e & 0xFFFFu;
                     break;
                 }
-                if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
-                --nr_budget;
+                if (NR_P_GIVE_UP) { NR_P_GAVE_UP(1u) break; }
             }
 #else
             const uint h = atomicAdd(nr_sync[pcp.sync_off + 0u], 1u);
@@ -2908,11 +2931,7 @@ void main() {
                 const uint qa = nr_qbase + (h - pcp.df_n0);
                 uint e = atomicAdd(nr_sync[qa], 0u);
                 while ((e & 0xFFFF0000u) != nr_tag) {
-                    if (nr_budget == 0u) {
-                        atomicMax(nr_sync[pcp.sync_off + 3u], 1u);
-                        break;
-                    }
-                    --nr_budget;
+                    if (NR_P_GIVE_UP) { NR_P_GAVE_UP(1u) break; }
                     e = atomicAdd(nr_sync[qa], 0u);
                 }
                 if ((e & 0xFFFF0000u) == nr_tag) it = e & 0xFFFFu;
@@ -2935,11 +2954,7 @@ void main() {
                         const uint qa1 = nr_qbase + (h1 - pcp.df_n0);
                         uint e1 = atomicAdd(nr_sync[qa1], 0u);
                         while ((e1 & 0xFFFF0000u) != nr_tag) {
-                            if (nr_budget == 0u) {
-                                atomicMax(nr_sync[pcp.sync_off + 3u], 1u);
-                                break;
-                            }
-                            --nr_budget;
+                            if (NR_P_GIVE_UP) { NR_P_GAVE_UP(1u) break; }
                             e1 = atomicAdd(nr_sync[qa1], 0u);
                         }
                         if ((e1 & 0xFFFF0000u) == nr_tag) it1 = e1 & 0xFFFFu;
@@ -3060,11 +3075,11 @@ void main() {
                         if (nr_e != 0xFFFFFFFFu) {
                             const uint nr_tt = (nr_e >> 20u) * nr_epoch;
                             while (nr_tb != 0u && subgroupBroadcastFirst(atomicAdd(nr_tc_u[nr_tc_wait + (nr_e & 0xFFFFFu)], 0u)) < nr_tt)
-                                --nr_tb;
+                                NR_TC_POLLED(nr_tb, nr_tc_err, nr_epoch)
                         }
                     }
                 }
-                if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_err], 1u);
+                if (nr_tb == 0u && subgroupElect()) atomicMax(nr_tc_u[nr_tc_err], nr_epoch << 1u);
             }
             barrier();
         }
